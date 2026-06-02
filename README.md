@@ -6,6 +6,10 @@ Original implementation of [**Speculative Pipeline Decoding: Higher-Accruacy and
 >
 > This repository is intended to **demonstrate algorithmic correctness** only. It has **not** been tuned for production performance: there is no system-level optimization, no integration with dedicated inference engines (e.g. vLLM, sglang), and the reference implementation still contains many **sequential** steps on the Python side. As a result, **wall-clock latency can be higher than standard autoregressive decoding** in this codebase, even when acceptance rates look favorable. Reported speedup metrics in `eval.py` is theoretical; treat measured end-to-end time here as a correctness baseline, not a deployment benchmark.
 
+## Method overview
+![Method](method.png)
+The architecture of Speculative Pipeline Decoding when the number of stages is 3. The target LLM is partitioned into 3 stages. At the start point of this round, tokens (e.g., $x_5$ to $x_7$) reside in the pipeline at varying depths while others (e.g., $x_1$ to $x_4$) are fully processed tokens. For each token, hidden states from passed stages are projected via FC layers to form an aggregated feature, serving as the input to the Pipeline Speculation Module. The Speculation Module speculates the next token ($x_8$) simultaneously with the target LLM's pipeline forward step. Then $x_8$'s token embedding is added to the pipeline for the next round, while the target LLM verifies the oldest token in the pipeline ($x_6$) based on ground-truth output logits of the token $x_5$ that is just popped out of the pipeline.
+
 ## Repository layout
 
 ```
