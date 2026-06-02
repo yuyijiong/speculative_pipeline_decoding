@@ -1,6 +1,6 @@
 # Speculative Pipeline Decoding
 
-Official implementation of **pipelined speculative decoding**. Compatible with Qwen3, Qwen3.5, Llama3.1, etc. The target model runs in a multi-stage pipeline while a lightweight speculation head drafts tokens in parallel; drafts are verified against the base model for lossless generation. This paradigm is totally different from the traditional speculative decoding, and achieves higher acceptance rate and zero latency bubble.
+Original implementation of [**Speculative Pipeline Decoding: Higher-Accruacy and Zero-Bubble Speculation via Pipeline Parallelism**](https://arxiv.org/abs/2605.30852). This is a novel speculative decoding paradigm, expected to address the issues of increasing difficulty and latency bubbles in traditional SD. Compatible with Qwen3, Qwen3.5, Llama3.1, etc. The target model runs in a multi-stage pipeline while a lightweight speculation head drafts tokens in parallel; drafts are verified against the base model for lossless generation. This paradigm is totally different from the traditional speculative decoding, and achieves higher acceptance rate and zero latency bubble.
 
 > **Important**
 >
@@ -73,14 +73,22 @@ Important flags:
 
 Output: `speculation_head_final.pt` under `--output_dir` (includes `state_dict` and `config` with `base_model_path`, `num_stages`, etc.).
 
+
+## Our trained checkpoints
+See [HF](https://huggingface.co/yuyijiong/speculative_pipeline_decoding)
+
+
 ## Quick demo (pipeline vs standard generate)
 
 ```bash
 python pipeline_inference.py \
   --spec_head_ckpt /path/to/speculation_head_final.pt \
+  --base_model_path Qwen/Qwen3.5-4B \
   --max_new_tokens 100 \
   --temperature 0.0
 ```
+
+If the checkpoint’s `config["base_model_path"]` already points to a valid local path or Hugging Face id on your machine, you can omit `--base_model_path`.
 
 Use `--temperature 1.0` for stochastic decoding, `--draft_top_k 4` for draft-tree top-k, and `--no-verify` only for debugging (not lossless).
 
@@ -97,6 +105,7 @@ Each line is EAGLE-style: `{"question_id": ..., "turns": ["user prompt", ...]}`;
 ```bash
 python eval.py \
   --spec_head_ckpt /path/to/speculation_head_final.pt \
+  --base_model_path Qwen/Qwen3.5-4B \
   --data_dir eval_data \
   --output_dir ./eval_output \
   --gpus 0 \
@@ -114,12 +123,16 @@ Multi-GPU: `--gpus 0,1,2,3`. Optional baseline cache: `--baseline --baseline_cac
 
 ## Citation
 
-If you use this code, please cite our paper:
+If you use this repo, please cite our paper:
 
 ```bibtex
-% TODO: add BibTeX when available
+@misc{yu2026speculativepipelinedecodinghigheraccruacy,
+      title={Speculative Pipeline Decoding: Higher-Accruacy and Zero-Bubble Speculation via Pipeline Parallelism}, 
+      author={Yijiong Yu and Huazheng Wang and Shuai Yuan and Ruilong Ren and Ji Pei},
+      year={2026},
+      eprint={2605.30852},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2605.30852}, 
+}
 ```
-
-## License
-
-Please refer to the license file in the repository root (to be added).

@@ -30,6 +30,11 @@ import torch.nn.functional as F
 import warnings
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
+
+from pipeline_linear_cache import (
+    crop_pipeline_cache_after_rejection,
+    install_pipeline_linear_cache_layers,
+)
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     TemperatureLogitsWarper,
@@ -234,7 +239,7 @@ def num_hidden_layers_from_hf_config(config: Any) -> int:
 
 def _linear_and_hybrid_attention_layer_indices_for_cache(dec_cfg: Any) -> List[int]:
     """
-    Layer indices whose cache slots must be rebuilt from a prefix forward after rejection.
+    Layer indices whose cache slots use pipeline snapshot rewind after rejection.
 
     Must match ``DynamicCache(config=...)`` indexing: ``layer_types`` with optional
     ``num_kv_shared_layers`` trim. Do **not** use ``isinstance(..., LinearAttentionLayer)``:
@@ -1231,93 +1236,21 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             return
         raise TypeError(f"Cannot roll back KV cache: unsupported past_key_values type {type(past_kv)}")
 
-    def _snapshot_linear_attention_cache_layers(
-        self,
-        past_kv: Cache,
-        layer_indices: Sequence[int],
-    ) -> Dict[int, Any]:
-        """
-        Clone cache slots for linear/hybrid attention layers only.
-        """
-        if not layer_indices:
-            return {}
-        if not hasattr(past_kv, "layers"):
-            raise TypeError(f"Cannot snapshot linear cache layers for type {type(past_kv)}.")
-        snaps: Dict[int, Any] = {}
-        for i in layer_indices:
-            li = int(i)
-            if li < 0 or li >= len(past_kv.layers):
-                raise RuntimeError(f"layer index {i} out of range for past_kv ({len(past_kv.layers)} layers).")
-            snaps[li] = copy.deepcopy(past_kv.layers[li])
-        return snaps
-
-    def _restore_linear_attention_cache_layers_from_stage_snapshots(
-        self,
-        past_kv: Cache,
-        snapshot_history: Sequence[Dict[int, Any]],
-        layer_indices: Sequence[int],
-        layers_per_stage: int,
-        num_stages: int,
-    ) -> None:
-        """
-        Restore linear/hybrid cache slots from rolling stage snapshots.
-
-        Snapshot history stores one copy per decode iteration (oldest -> newest). For a rollback to
-        the currently verified prefix, shallower stages must rewind more steps than deeper stages.
-        """
-        if not layer_indices:
-            return
-        if not hasattr(past_kv, "layers"):
-            raise TypeError(f"Cannot restore linear cache layers for type {type(past_kv)}.")
-        if layers_per_stage <= 0:
-            raise ValueError(f"layers_per_stage must be > 0, got {layers_per_stage}.")
-        if num_stages <= 0:
-            raise ValueError(f"num_stages must be > 0, got {num_stages}.")
-        if len(snapshot_history) < num_stages:
-            raise RuntimeError(
-                f"Need at least {num_stages} linear-cache snapshots for rollback, got {len(snapshot_history)}."
-            )
-        latest_idx = len(snapshot_history) - 1
-        for i in layer_indices:
-            li = int(i)
-            stage_idx = li // int(layers_per_stage)
-            if stage_idx < 0 or stage_idx >= int(num_stages):
-                raise RuntimeError(
-                    f"layer index {li} maps to invalid stage {stage_idx} "
-                    f"(layers_per_stage={layers_per_stage}, num_stages={num_stages})."
-                )
-            rewind_steps = int(num_stages) - 1 - stage_idx
-            hist_idx = latest_idx - rewind_steps
-            if hist_idx < 0:
-                raise RuntimeError(
-                    f"Cannot restore layer {li}: history index {hist_idx} < 0 (rewind={rewind_steps})."
-                )
-            src = snapshot_history[hist_idx]
-            if li not in src:
-                raise RuntimeError(f"Linear cache snapshot at history[{hist_idx}] misses layer {li}.")
-            past_kv.layers[li] = copy.deepcopy(src[li])
-
     def _rollback_kv_cache_after_rejection(
         self,
         past_kv: Cache,
         target_length: int,
-        linear_cache_snapshots: Sequence[Dict[int, Any]],
         linear_layer_indices: Sequence[int],
         layers_per_stage: int,
         num_stages: int,
     ) -> None:
-        """
-        Roll back target-model cache on draft rejection:
-        - ``crop`` all layers for standard KV slots;
-        - restore linear/hybrid slots from rolling snapshots (no full-prefix rebuild).
-        """
-        self._rollback_kv_cache(past_kv, target_length)
-        self._restore_linear_attention_cache_layers_from_stage_snapshots(
+        """Roll back target-model cache on draft rejection (KV crop + linear snapshot rewind)."""
+        crop_pipeline_cache_after_rejection(
             past_kv,
-            linear_cache_snapshots,
-            linear_layer_indices,
-            layers_per_stage,
-            num_stages,
+            target_length,
+            linear_layer_indices=linear_layer_indices,
+            layers_per_stage=layers_per_stage,
+            num_stages=num_stages,
         )
 
     def _rollback_spec_kv_cache(self, spec_past: Cache, target_length: int) -> None:
@@ -1433,7 +1366,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         snap_want = self._snap_indices_needed()
         dec_cfg = _decoder_relevant_config(self.config)
         linear_cache_layer_indices = _linear_and_hybrid_attention_layer_indices_for_cache(dec_cfg)
-        linear_cache_snapshots: List[Dict[int, Any]] = []
 
         outputs = self.base_model(
             input_ids=input_ids,
@@ -1442,6 +1374,7 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             return_dict=True,
         )
         past_kv: Cache = outputs.past_key_values
+        install_pipeline_linear_cache_layers(past_kv, linear_cache_layer_indices, n)
         all_hs = outputs.hidden_states
 
         completed_snaps: Dict[int, Dict[int, torch.Tensor]] = self._extract_position_snapshots_from_hidden_states(
@@ -1648,11 +1581,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             acc_timings[0] += iter_stage_sec
             if L_pl > 1:
                 acc_timings[1] += iter_stage_sec * float(L_pl - 1) / float(L_pl)
-            if linear_cache_layer_indices:
-                linear_cache_snapshots.append(
-                    self._snapshot_linear_attention_cache_layers(past_kv, linear_cache_layer_indices)
-                )
-
             if use_streams and pipeline:
                 newest_event = pipeline[0].get("ready_event")
                 if newest_event is not None:
@@ -1704,7 +1632,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                             self._rollback_kv_cache_after_rejection(
                                 past_kv,
                                 target_pos,
-                                linear_cache_snapshots,
                                 linear_cache_layer_indices,
                                 lps,
                                 n,
@@ -1724,7 +1651,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                             ]
                             next_position = target_pos + 1
                             verified_up_to = target_pos + 1
-                            linear_cache_snapshots = []
                             for pk in [k for k in list(draft_full_q.keys()) if k >= target_pos]:
                                 del draft_full_q[pk]
                             prev_evicted_snap = None
@@ -1745,8 +1671,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                 prev_evicted_snap = dict(completed["snap"])
                 prev_evicted_pos = int(completed_pos)
                 pipeline.pop()
-                if linear_cache_layer_indices and len(linear_cache_snapshots) >= n:
-                    linear_cache_snapshots.pop(0)
 
             if pending_spec_logits is not None:
                 spec_logits = pending_spec_logits
@@ -1844,6 +1768,7 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             return_dict=True,
         )
         base_past_kv: Cache = outputs.past_key_values
+        install_pipeline_linear_cache_layers(base_past_kv, linear_cache_layer_indices, n)
         all_hs = outputs.hidden_states
         completed_snaps = self._extract_position_snapshots_from_hidden_states(all_hs)
 
@@ -1893,7 +1818,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             ],
             "completed_snaps": completed_snaps,
             "draft_full_q": {},
-            "linear_cache_snapshots": [],
             "next_position": s0 + 1,
             "generated_ids": [first_token_id],
             "token_acceptance": [True],
@@ -1942,7 +1866,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                 ],
                 "completed_snaps": dict(chain["completed_snaps"]),
                 "draft_full_q": dict(chain["draft_full_q"]),
-                "linear_cache_snapshots": list(chain["linear_cache_snapshots"]),
                 "next_position": int(chain["next_position"]),
                 "generated_ids": list(chain["generated_ids"]),
                 "token_acceptance": list(chain["token_acceptance"]),
@@ -2103,13 +2026,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                     entry["snap"].update(collected)
                     iter_stage_sec_cpu += time.perf_counter() - t0_s
 
-                if linear_cache_layer_indices:
-                    chain["linear_cache_snapshots"].append(
-                        self._snapshot_linear_attention_cache_layers(
-                            chain["past_kv"], linear_cache_layer_indices
-                        )
-                    )
-
                 if len(pipeline) >= n:
                     completed = pipeline[-1]
                     completed_pos = int(completed["pos"])
@@ -2174,8 +2090,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                         chosen_chain["prev_evicted_snap"] = dict(completed_tail["snap"])
                         chosen_chain["prev_evicted_pos"] = int(completed_tail["pos"])
                         chosen_chain["pipeline"].pop()
-                        if linear_cache_layer_indices and len(chosen_chain["linear_cache_snapshots"]) >= n:
-                            chosen_chain["linear_cache_snapshots"].pop(0)
                     chains = [chosen_chain]
                     if accepted_id == eos_token_id:
                         return _finalize_generate_timing(
@@ -2193,7 +2107,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                     self._rollback_kv_cache_after_rejection(
                         chosen_chain["past_kv"],
                         target_pos,
-                        chosen_chain["linear_cache_snapshots"],
                         linear_cache_layer_indices,
                         lps,
                         n,
@@ -2219,7 +2132,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                         }
                     ]
                     chosen_chain["next_position"] = target_pos + 1
-                    chosen_chain["linear_cache_snapshots"] = []
                     chosen_chain["score"] = 0.0
                     chosen_chain["prev_evicted_snap"] = None
                     chosen_chain["prev_evicted_pos"] = None
@@ -2242,8 +2154,6 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                         c["prev_evicted_snap"] = dict(ct["snap"])
                         c["prev_evicted_pos"] = int(ct["pos"])
                         c["pipeline"].pop()
-                        if linear_cache_layer_indices and len(c["linear_cache_snapshots"]) >= n:
-                            c["linear_cache_snapshots"].pop(0)
 
             if len(verified_ids) >= max_new_tokens:
                 break

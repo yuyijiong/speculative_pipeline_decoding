@@ -27,8 +27,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--spec_head_ckpt",
         type=_non_empty_ckpt_path,
-        default="",
+        default="/share/yyj/pipeline_decoding/train_eval_runs_qwen3.5-4b-stage4-8-16-v10_4b/train/cfg_0000_v10_m-Qwen3.5-4B_s4_l2_f01546c665/speculation_head_final.pt",
         help="Path to speculation_head.pt (state_dict + config); must not be empty.",
+    )
+    p.add_argument(
+        "--base_model_path",
+        type=str,
+        default="",
+        help=(
+            "Hugging Face id or local path for the base model. "
+            "When non-empty, overrides config['base_model_path'] inside the checkpoint."
+        ),
     )
     p.add_argument("--max_new_tokens", type=int, default=100)
     p.add_argument(
@@ -97,11 +106,25 @@ def _read_spec_config(path: str) -> dict[str, Any]:
     return cfg
 
 
-def _resolve_base_model_path(cfg: dict[str, Any], ckpt_path: str) -> str:
+def _base_model_path_override(value: str | None) -> str | None:
+    p = str(value or "").strip()
+    return p if p else None
+
+
+def _resolve_base_model_path(
+    cfg: dict[str, Any],
+    ckpt_path: str,
+    *,
+    override: str | None = None,
+) -> str:
+    o = _base_model_path_override(override)
+    if o is not None:
+        return o
     model_path = str(cfg.get("base_model_path", "")).strip()
     if not model_path:
         raise ValueError(
-            f"Checkpoint 'config' at {ckpt_path!r} must include non-empty 'base_model_path'."
+            f"Checkpoint 'config' at {ckpt_path!r} must include non-empty 'base_model_path' "
+            "(or pass --base_model_path)."
         )
     return model_path
 
@@ -287,7 +310,9 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     ckpt_path = args.spec_head_ckpt
     spec_cfg = _read_spec_config(ckpt_path)
-    base_model_path = _resolve_base_model_path(spec_cfg, ckpt_path)
+    base_model_path = _resolve_base_model_path(
+        spec_cfg, ckpt_path, override=args.base_model_path
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_path, trust_remote_code=True

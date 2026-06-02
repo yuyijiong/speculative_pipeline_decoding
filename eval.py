@@ -95,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         help="One or more speculation_head checkpoints (each evaluated separately)",
     )
     p.add_argument(
+        "--base_model_path",
+        type=str,
+        default="",
+        help=(
+            "Hugging Face id or local path for the base model. "
+            "When non-empty, overrides config['base_model_path'] inside each checkpoint."
+        ),
+    )
+    p.add_argument(
         "--output_dir",
         type=str,
         default="./eval_output",
@@ -629,7 +638,16 @@ def ensure_baseline_cache(
     return {int(r["index"]): r for r in rows}
 
 
-def _unique_base_model_paths_in_order(ckpt_list: list[str]) -> list[str]:
+def _unique_base_model_paths_in_order(
+    ckpt_list: list[str],
+    *,
+    override: str | None = None,
+) -> list[str]:
+    from pipeline_inference import _base_model_path_override, _resolve_base_model_path
+
+    o = _base_model_path_override(override)
+    if o is not None:
+        return [o]
     seen: set[str] = set()
     out: list[str] = []
     for ck in ckpt_list:
@@ -852,16 +870,6 @@ def _args_to_dict(args: argparse.Namespace) -> dict[str, Any]:
     return d
 
 
-def _resolve_base_model_path(spec_cfg: dict[str, Any], ckpt_path: str) -> str:
-    model_path = str(spec_cfg.get("base_model_path", "")).strip()
-    if not model_path:
-        raise ValueError(
-            f"Checkpoint config at {ckpt_path!r} must include non-empty 'base_model_path'. "
-            "Please re-save checkpoints with the updated training/model code (``base_model_path`` in config)."
-        )
-    return model_path
-
-
 def _build_inference_stack(args: Any) -> Tuple[Any, Any, Any, int]:
     """Load tokenizer, base model, pipeline once. ``args.temperature`` must be a float (worker / per-step scalar)."""
     import torch
@@ -872,11 +880,16 @@ def _build_inference_stack(args: Any) -> Tuple[Any, Any, Any, int]:
     from pipeline_inference import (
         _infer_pipeline_kind,
         _read_spec_config,
+        _resolve_base_model_path,
         build_pipeline_from_spec_ckpt,
     )
 
     spec_cfg = _read_spec_config(args.spec_head_ckpt)
-    base_model_path = _resolve_base_model_path(spec_cfg, args.spec_head_ckpt)
+    base_model_path = _resolve_base_model_path(
+        spec_cfg,
+        args.spec_head_ckpt,
+        override=getattr(args, "base_model_path", ""),
+    )
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1286,6 +1299,8 @@ def _print_aggregates(per_sample: list[dict[str, Any]], summary: dict[str, Any])
 
 
 def main() -> None:
+    from pipeline_inference import _resolve_base_model_path
+
     args = parse_args()
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
@@ -1338,7 +1353,9 @@ def main() -> None:
     baseline_map_by_key: dict[tuple[str, float], dict[int, dict[str, Any]]] = {}
     if bool(args.baseline):
         baseline_root.mkdir(parents=True, exist_ok=True)
-        unique_bases = _unique_base_model_paths_in_order(ckpt_list)
+        unique_bases = _unique_base_model_paths_in_order(
+            ckpt_list, override=args.base_model_path
+        )
         prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
         modified_cuda_for_baseline_single = False
         try:
@@ -1422,7 +1439,11 @@ def main() -> None:
                         "temperature": float(temp),
                         "draft_top_k": int(dtk),
                     }
-                    base_model_path = _resolve_base_model_path(_read_spec_config_lite(ckpt_path), ckpt_path)
+                    base_model_path = _resolve_base_model_path(
+                        _read_spec_config_lite(ckpt_path),
+                        ckpt_path,
+                        override=args.base_model_path,
+                    )
                     if bool(args.baseline):
                         base_vars["baseline_cache_path"] = str(
                             baseline_path_by_key[(base_model_path, float(temp))]
@@ -1503,7 +1524,11 @@ def main() -> None:
             args_first = SimpleNamespace(**first_vars)
             tokenizer, pipeline, device, num_stages_stack = _build_inference_stack(args_first)
             num_stages = int(num_stages_stack)
-            base_model_path_ck = _resolve_base_model_path(_read_spec_config_lite(ckpt_path), ckpt_path)
+            base_model_path_ck = _resolve_base_model_path(
+                _read_spec_config_lite(ckpt_path),
+                ckpt_path,
+                override=args.base_model_path,
+            )
 
             for temp in temperatures:
                 for dtk in draft_top_ks:
@@ -1577,7 +1602,11 @@ def main() -> None:
             "checkpoint_path": ckpt_path,
             "spec_head_ckpt_list_in_session": ckpt_list,
             "checkpoint_filename_tag": ckpt_tag,
-            "model": _resolve_base_model_path(_read_spec_config_lite(ckpt_path), ckpt_path),
+            "model": _resolve_base_model_path(
+                _read_spec_config_lite(ckpt_path),
+                ckpt_path,
+                override=args.base_model_path,
+            ),
             "data_dir": str(data_dir),
             "num_prompts": n_total,
             "seed": args.seed,
