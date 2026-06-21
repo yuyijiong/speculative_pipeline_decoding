@@ -14,8 +14,9 @@ The architecture of Speculative Pipeline Decoding when the number of stages is 3
 
 ```
 speculative_pipeline_decoding/
-├── pipeline_model.py       # Qwen3SpeculativePipelineModel + speculation head
-├── train.py                # Train the speculation head
+├── pipeline_model.py       # Qwen3SpeculativePipelineModel (v11) + speculation head
+├── old_version_v10/        # Archived v10 implementation (training / inference / eval)
+├── train.py                # Train the speculation head (v11)
 ├── pipeline_inference.py   # Load checkpoint, run pipeline / HF generate
 ├── eval.py                 # Benchmark on bundled eval sets
 ├── eval_data/              # MT-Bench, HumanEval, GSM8K prompts (EAGLE jsonl format)
@@ -24,7 +25,7 @@ speculative_pipeline_decoding/
 └── README.md
 ```
 
-Checkpoints store `config['version'] == 10` and are compatible with weights trained by this release’s `train.py`.
+Checkpoints store `config['version'] == 11` and are compatible with weights trained by this release’s `train.py`. v10 checkpoints are supported via `old_version_v10/`.
 
 ## Requirements
 
@@ -71,7 +72,8 @@ Important flags:
 | Flag | Description |
 |------|-------------|
 | `--num_stages` | Pipeline depth `n` (target stages) |
-| `--num_spec_layers` | Transformer Layers in the speculation module |
+| `--num_spec_layers` | Transformer layers in the speculation module |
+| `--aggr_feature_bound` | Comma-separated HF hidden-state anchors for `g_0..g_{m-1}` (`auto` for default) |
 | `--draft_vocab_json` | Path to a draft vocabulary JSON under `draft_vocab/` (see above). Empty string = full base vocabulary. |
 
 

@@ -1,20 +1,13 @@
 """
-Pipelined speculative decoding for Qwen3-family models.
-========================================================
+Pipelined speculative decoding for Qwen3-family models (v11).
+===========================================================
 
-Implementation of the parallel target/speculation schedule:
+See ``结构v11.md`` for ``aggr_feature_bound``, training mask, and inference schedule.
 
-- **Inference**: target pipeline step and speculation run in parallel each round. Speculation consumes
-  ``[g_n^{evicted}, g_{n-1}, ..., g_1, g_0]`` (``n+1`` rows when an evicted token exists), so the
-  reusable KV prefix rolls back one more slot than v9 (drop last ``n`` speculative keys when full).
-- **Training**: spec tower sees ``[g_n, g_{n-1}, ..., g_1, g_0]`` — **(n+1)·S** tokens; ``g_0`` 仅来自
-  token embedding，经 ``g0_proj`` **FC** 后再输入塔内；**仅** ``g_0^t`` 为 query。Attention 与 v7 一致：
-  ``g_0^t`` may attend ``g_k^T`` iff ``T<=t`` and ``k=min(n, t-T)``（远处为 ``g_n``，与推理 + KV 一致）。
-  当 ``simulated_pipeline_fill = n-a`` 时，``g_{n-1}..g_{n-a}`` 复用融合后的 ``g_n`` 行。
-
-- Per-stage projections; **``g_0``** 仅取自 token embedding，经独立 **FC** ``g0_proj`` 后再与其它 ``g_k`` 一并进入 speculation tower。
-- Fixed memory ``g_n..g_1`` 上对 ``g_n..g_2`` 使用 per-layer FC（与 v9 相同）。
-- Speculation tower uses ``Qwen3DecoderLayer`` plus rotary cloned from the base model.
+- **Inference**: same parallel target/speculation schedule as v10; rows use ``g_(f(d), d)`` via
+  ``aggr_feature_bound`` depth mapping.
+- **Training**: ``m`` aggregation blocks ``[g_{m-1}, ..., g_0]`` (not ``n+1``); all blocks are
+  Q/K/V; only ``g_0`` feeds ``lm_head``.
 """
 
 from __future__ import annotations
@@ -257,8 +250,26 @@ def _linear_and_hybrid_attention_layer_indices_for_cache(dec_cfg: Any) -> List[i
 
 
 def _speculation_attn_config(config) -> Any:
+    """Deep copy base decoder config; inference keeps the same attn as the target LLM."""
     c = copy.deepcopy(config)
     return c
+
+
+@contextmanager
+def _force_sdpa_attn_context(config):
+    """Training-only: 4D custom mask requires SDPA (FA2 cannot consume it)."""
+    saved: Dict[str, Any] = {}
+    for name in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
+        if hasattr(config, name):
+            saved[name] = getattr(config, name)
+            setattr(config, name, "sdpa")
+    if "_attn_implementation" not in saved:
+        raise AttributeError("config is missing required attribute _attn_implementation")
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(config, name, value)
 
 
 def _get_apply_rotary_pos_emb(config):
@@ -411,60 +422,77 @@ def _copy_matching_decoder_layer_weights_from_base(
             stacklevel=2,
         )
 
-def _build_pipeline_training_mask(
-    attention_mask_ns: torch.Tensor,
+def _build_pipeline_training_mask_v11(
+    attention_mask_ms: torch.Tensor,
     *,
     n: int,
+    m: int,
     s: int,
+    aggr_to_min_depth: Sequence[int],
+    stage_depth_to_aggr_idx: Sequence[int],
     mask_dtype: torch.dtype,
+    simulated_pipeline_fill: int,
 ) -> torch.Tensor:
     """
-    ``[B, (n+1)*S]`` padding mask -> ``[B, 1, S, (n+1)*S]`` additive mask.
+    ``[B, m*S]`` padding mask -> ``[B, 1, m*S, m*S]`` additive mask.
 
-    Layout (stage-major): blocks ``b=0..n`` are ``g_n, g_{n-1}, ..., g_0``; each block has time
-    ``0..S-1``. Only ``g_0`` queries (last block). Structural rule (v7 with ``i=0``): ``g_0^t`` attends
-    ``g_k^T`` iff ``T<=t`` and ``k = min(n, t-T)``.
+    Layout (stage-major): blocks ``b=0..m-1`` are ``g_{m-1}, ..., g_0``; each block has time ``0..S-1``.
+    Query at block ``bq``, position ``t`` uses representative depth ``d_q = aggr_to_min_depth[m-1-bq]``.
+    Key at block ``bk``, position ``T`` is visible iff ``T<=t`` and the required key block index
+    ``stage_depth_to_aggr_idx[d']`` equals ``m-1-bk``, where ``d' = min(n, d_q + t - T)``.
+
+    When ``simulated_pipeline_fill < n`` (partial pipeline), keys at distance ``t-T >= fill`` must
+  attend the deepest block ``g_m`` (aggr index ``m-1``) instead of ``g(d')`` — unlike v10 we only
+    change the mask (v11 may map multiple depths to one block).
     """
-    b, lseq = attention_mask_ns.shape
-    n1 = int(n) + 1
-    if lseq != n1 * s:
-        raise ValueError(f"expected length (n+1)*S={n1 * s}, got {lseq}")
-    device = attention_mask_ns.device
+    b, lseq = attention_mask_ms.shape
+    m_i = int(m)
+    if lseq != m_i * s:
+        raise ValueError(f"expected length m*S={m_i * s}, got {lseq}")
+    device = attention_mask_ms.device
     neg = torch.finfo(mask_dtype).min
 
     pos_list: List[int] = []
-    i_list: List[int] = []
-    for block in range(n1):
-        i_st = int(n) - int(block)
+    block_list: List[int] = []
+    for block in range(m_i):
         for t in range(s):
             pos_list.append(t)
-            i_list.append(i_st)
-    pos = torch.tensor(pos_list, device=device, dtype=torch.long)  # [(n+1)S]
-    i_t = torch.tensor(i_list, device=device, dtype=torch.long)  # [(n+1)S]
+            block_list.append(block)
+    pos = torch.tensor(pos_list, device=device, dtype=torch.long)
+    blocks = torch.tensor(block_list, device=device, dtype=torch.long)
 
-    pq = torch.arange(s, device=device, dtype=torch.long).view(1, 1, s, 1)
-    iq = torch.zeros((1, 1, s, 1), device=device, dtype=torch.long)
-    pk = pos.view(1, 1, 1, lseq)
-    ik = i_t.view(1, 1, 1, lseq)
+    aggr_to_min = torch.tensor(list(aggr_to_min_depth), device=device, dtype=torch.long)
+    depth_to_aggr = torch.tensor(list(stage_depth_to_aggr_idx), device=device, dtype=torch.long)
     n_t = torch.tensor(int(n), device=device, dtype=torch.long)
 
-    k_required = torch.minimum(n_t, iq + (pq - pk))
-    structural = (pk <= pq) & (ik == k_required)
+    aggr_i_flat = m_i - 1 - blocks
+    dq_flat = aggr_to_min[aggr_i_flat]
+    dq = dq_flat.view(1, 1, lseq, 1)
+    pq = pos.view(1, 1, lseq, 1)
+    pk = pos.view(1, 1, 1, lseq)
+    aggr_k = aggr_i_flat.view(1, 1, 1, lseq)
 
-    v = attention_mask_ns.to(dtype=torch.bool)
-    q_valid = v[:, int(n) * s : n1 * s].view(b, 1, s, 1)
+    delta = pq - pk
+    d_prime = torch.minimum(n_t, dq + delta)
+    d_prime = d_prime.clamp(min=0)
+    k_aggr_required = depth_to_aggr[d_prime]
+    fill = int(simulated_pipeline_fill)
+    if fill < int(n):
+        fill_t = torch.tensor(fill, device=device, dtype=torch.long)
+        deepest_aggr = torch.tensor(m_i - 1, device=device, dtype=torch.long)
+        k_aggr_required = torch.where(delta >= fill_t, deepest_aggr, k_aggr_required)
+    structural = (pk <= pq) & (aggr_k == k_aggr_required)
+
+    v = attention_mask_ms.to(dtype=torch.bool)
+    q_valid = v.view(b, 1, lseq, 1)
     k_valid = v.view(b, 1, 1, lseq)
     return torch.where(structural & q_valid & k_valid, torch.zeros((), device=device, dtype=mask_dtype), neg)
 
 
-class SpeculationHeadTransformer(nn.Module):
+class SpeculationTransformerModuleV11(nn.Module):
     """
-    Speculation transformer (v10): per-stage ``g_1..g_n`` projections plus ``g_0``.
-    ``g_0`` 仅由 token embedding 经可学习 FC ``g0_proj`` 得到；训练为 **(n+1)·S** 布局 ``[g_n,...,g_0]``，
-    仅 ``g_0`` 为 query，结构 mask 同 v7；推理为 decoder + KV（``n`` 或 ``n+1`` 个 query 位置）。
-
-    Fixed 段 ``g_n..g_1`` 上对 stage ``>1`` 使用与 v9 相同的 per-layer FC。
-    Uses ``Qwen3DecoderLayer`` plus rotary cloned from the base model.
+    Speculation transformer (v11): ``m`` aggregation types via one input FC each; training layout
+    ``[g_{m-1}, ..., g_0]`` with all rows as Q/K/V; inference uses standard decoder + KV cache.
     """
 
     def __init__(
@@ -474,7 +502,8 @@ class SpeculationHeadTransformer(nn.Module):
         device: torch.device,
         base_rotary_emb: nn.Module,
         apply_rotary_fn,
-        stage_feature_hf_indices: Sequence[Sequence[int]],
+        aggr_feature_indices: Sequence[Sequence[int]],
+        num_aggr_types: int,
         num_spec_layers: int = 1,
         init_weights_from_base_layer_indices: Optional[Sequence[int]] = None,
         base_decoder_layers: Optional[nn.ModuleList] = None,
@@ -485,8 +514,11 @@ class SpeculationHeadTransformer(nn.Module):
         self.config = config
         self._decoder_layer_cls = decoder_layer_cls or PipelineDecoderLayer
         self.num_spec_layers = int(num_spec_layers)
+        self.num_aggr_types = int(num_aggr_types)
         if self.num_spec_layers < 1:
             raise ValueError(f"num_spec_layers must be >= 1, got {num_spec_layers}")
+        if self.num_aggr_types < 1:
+            raise ValueError(f"num_aggr_types must be >= 1, got {num_aggr_types}")
         if (init_weights_from_base_layer_indices is None) ^ (base_decoder_layers is None):
             raise ValueError(
                 "init_weights_from_base_layer_indices and base_decoder_layers must be both set or both omitted."
@@ -502,19 +534,20 @@ class SpeculationHeadTransformer(nn.Module):
                 if not isinstance(j, int) or j < 0 or j >= n_base:
                     raise ValueError(f"init_weights_from_base_layer_indices[{i}] out of range: {j}")
 
-        self.stage_feature_hf_indices = [tuple(int(x) for x in row) for row in stage_feature_hf_indices]
-        if not self.stage_feature_hf_indices:
-            raise ValueError("stage_feature_hf_indices must be non-empty.")
+        self.aggr_feature_indices = [tuple(int(x) for x in row) for row in aggr_feature_indices]
+        if len(self.aggr_feature_indices) != self.num_aggr_types:
+            raise ValueError(
+                f"aggr_feature_indices length {len(self.aggr_feature_indices)} != num_aggr_types {self.num_aggr_types}"
+            )
         h = int(config.hidden_size)
-        self.stage_projs = nn.ModuleList(
+        self.aggr_projs = nn.ModuleList(
             [
                 nn.Linear(len(row) * h, h, bias=False, device=device, dtype=dtype)
-                for row in self.stage_feature_hf_indices
+                for row in self.aggr_feature_indices
             ]
         )
-        # g_0 只能来自 token embedding (H_0)，进入 speculation 塔前必须经过可学习 FC（与其它 g 的 stage_proj 一致）
-        self.g0_proj = nn.Linear(h, h, bias=False, device=device, dtype=dtype)
-        nn.init.normal_(self.g0_proj.weight, std=0.02)
+        for proj in self.aggr_projs:
+            nn.init.normal_(proj.weight, std=0.02)
 
         self.draft_vocab_size = int(draft_vocab_size) if draft_vocab_size is not None else int(config.vocab_size)
         self.lm_head = nn.Linear(h, self.draft_vocab_size, bias=False, device=device, dtype=dtype)
@@ -539,109 +572,38 @@ class SpeculationHeadTransformer(nn.Module):
                 )
                 _force_spec_layer_full_attention(self.spec_layers[spec_i])
 
-        self.num_stages = len(self.stage_feature_hf_indices)
-        self.fixed_stage_per_layer_projs = nn.ModuleList(
-            [
-                nn.ModuleList(
-                    [
-                        nn.Linear(
-                            int(config.hidden_size),
-                            int(config.hidden_size),
-                            bias=False,
-                            device=device,
-                            dtype=dtype,
-                        )
-                        for _ in range(max(self.num_stages, 0))
-                    ]
-                )
-                for _ in range(self.num_spec_layers)
-            ]
-        )
-        for layer_projs in self.fixed_stage_per_layer_projs:
-            for p in layer_projs:
-                nn.init.eye_(p.weight)
-
-    def _infer_stage_ids(self, q_len: int, device: torch.device) -> torch.LongTensor:
-        if q_len == self.num_stages + 1:
-            return torch.arange(self.num_stages, -1, -1, device=device, dtype=torch.long)
-        if q_len == self.num_stages:
-            return torch.arange(self.num_stages - 1, -1, -1, device=device, dtype=torch.long)
-        return torch.full((q_len,), self.num_stages, device=device, dtype=torch.long)
-
-    def _apply_fixed_stage_fc(
-        self,
-        h: torch.Tensor,
-        stage_ids: torch.LongTensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        if self.num_stages < 1:
-            return h
-        out = h
-        for i in range(self.num_stages):
-            stage_value = self.num_stages - i
-            idx = torch.nonzero(stage_ids == stage_value, as_tuple=False).squeeze(-1)
-            if idx.numel() == 0:
-                continue
-            out[:, idx, :] = self.fixed_stage_per_layer_projs[layer_idx][i](out[:, idx, :])
-        return out
-
-    def _apply_inference_fixed_transform(
-        self,
-        fixed_hidden_states: torch.Tensor,
-        fixed_stage_ids: torch.LongTensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self._apply_fixed_stage_fc(fixed_hidden_states, fixed_stage_ids, layer_idx)
-
-    def forward_inference_g1_only_with_rotary(
+    def _decoder_forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor],
+        *,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
-        stage_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        if hidden_states.shape[-1] != int(self.config.hidden_size):
-            raise ValueError(
-                f"hidden_states last dim must be hidden_size={self.config.hidden_size}, got {hidden_states.shape[-1]}"
-            )
         _, q_len, _ = hidden_states.shape
         device = hidden_states.device
         layer_past = past_key_values if use_cache else None
         past_seen = past_key_values.get_seq_length() if layer_past is not None else 0
         cache_position = torch.arange(past_seen, past_seen + q_len, device=device, dtype=torch.long)
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": hidden_states,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": layer_past,
-            "position_ids": position_ids,
-        }
-        attn_mask = create_causal_mask(**mask_kwargs)
-
-        if stage_ids is None:
-            stage_ids = self._infer_stage_ids(q_len, device=device)
-        if stage_ids.shape != (q_len,):
-            raise ValueError(f"stage_ids must have shape [{q_len}], got {tuple(stage_ids.shape)}")
-
-        fixed_idx = torch.nonzero(stage_ids > 0, as_tuple=False).squeeze(-1)
-        query_idx = torch.nonzero(stage_ids == 0, as_tuple=False).squeeze(-1)
-        base_fixed = hidden_states[:, fixed_idx, :] if fixed_idx.numel() > 0 else None
-        g_query_cur = hidden_states[:, query_idx, :] if query_idx.numel() > 0 else None
+        if attention_mask is None and use_cache:
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": hidden_states,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": layer_past,
+                "position_ids": position_ids,
+            }
+            attn_mask = create_causal_mask(**mask_kwargs)
+        else:
+            attn_mask = attention_mask
 
         out = hidden_states
-        for li, layer in enumerate(self.spec_layers):
-            full_in = hidden_states.clone()
-            if fixed_idx.numel() > 0 and base_fixed is not None:
-                fixed_cur = self._apply_inference_fixed_transform(base_fixed, stage_ids[fixed_idx], li)
-                full_in[:, fixed_idx, :] = fixed_cur
-            if query_idx.numel() > 0 and g_query_cur is not None:
-                full_in[:, query_idx, :] = g_query_cur
-            position_embeddings = self.rotary_emb(full_in, position_ids)
+        for layer in self.spec_layers:
+            position_embeddings = self.rotary_emb(out, position_ids)
             out = layer(
-                full_in,
+                out,
                 attention_mask=attn_mask,
                 position_ids=position_ids,
                 past_key_values=layer_past,
@@ -649,10 +611,6 @@ class SpeculationHeadTransformer(nn.Module):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
-            if query_idx.numel() > 0:
-                g_query_cur = out[:, query_idx, :]
-        if query_idx.numel() > 0:
-            return out[:, query_idx, :]
         return out
 
     def forward_inference_with_rotary(
@@ -664,117 +622,73 @@ class SpeculationHeadTransformer(nn.Module):
         use_cache: bool = False,
         stage_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        # Backward-compatible alias.
-        return self.forward_inference_g1_only_with_rotary(
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
+        del stage_ids
+        if hidden_states.shape[-1] != int(self.config.hidden_size):
+            raise ValueError(
+                f"hidden_states last dim must be hidden_size={self.config.hidden_size}, got {hidden_states.shape[-1]}"
+            )
+        out = self._decoder_forward(
+            hidden_states,
+            position_ids,
+            attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            stage_ids=stage_ids,
         )
+        return out[:, -1:, :]
 
-    def forward_training_g1_only_with_rotary(
+    def forward_inference_g1_only_with_rotary(self, *args, **kwargs) -> torch.Tensor:
+        return self.forward_inference_with_rotary(*args, **kwargs)
+
+    def forward_training_with_rotary(
         self,
-        hidden_states_ns: torch.Tensor,
-        position_ids_ns: torch.LongTensor,
-        attention_mask_g1_to_ns: torch.Tensor,
+        hidden_states_ms: torch.Tensor,
+        position_ids_ms: torch.LongTensor,
+        attention_mask_ms: torch.Tensor,
         *,
-        num_stages: int,
+        num_aggr_types: int,
     ) -> torch.Tensor:
-        bsz, n_s, hidden = hidden_states_ns.shape
+        bsz, ms_len, hidden = hidden_states_ms.shape
         if hidden != int(self.config.hidden_size):
             raise ValueError(
-                f"hidden_states last dim must be hidden_size={self.config.hidden_size}, got {hidden_states_ns.shape[-1]}"
+                f"hidden_states last dim must be hidden_size={self.config.hidden_size}, got {hidden_states_ms.shape[-1]}"
             )
-        n_bl = int(num_stages) + 1
-        if n_s % n_bl != 0:
-            raise ValueError(f"(n+1)*S must divide sequence length; got nS={n_s}, n={num_stages}")
-        s = n_s // n_bl
-        n_pipe = int(num_stages)
-        fixed_len = n_pipe * s
-        if attention_mask_g1_to_ns.shape != (bsz, 1, s, n_s):
+        m = int(num_aggr_types)
+        if ms_len % m != 0:
+            raise ValueError(f"m*S must divide sequence length; got mS={ms_len}, m={m}")
+        s = ms_len // m
+        if attention_mask_ms.shape != (bsz, 1, ms_len, ms_len):
             raise ValueError(
-                f"attention_mask_g1_to_ns must be [B,1,S,(n+1)S], got {tuple(attention_mask_g1_to_ns.shape)}"
+                f"attention_mask_ms must be [B,1,m*S,m*S], got {tuple(attention_mask_ms.shape)}"
             )
 
-        fixed_memory_0 = hidden_states_ns[:, :fixed_len, :]
-        g1_cur = hidden_states_ns[:, fixed_len:, :]
-
-        stage_ids = torch.repeat_interleave(
-            torch.arange(n_pipe, 0, -1, device=hidden_states_ns.device, dtype=torch.long),
-            s,
-            dim=0,
-        )
-
-        for li, layer in enumerate(self.spec_layers):
-            fixed_memory = self._apply_fixed_stage_fc(fixed_memory_0, stage_ids, li)
-            full_in = torch.cat([fixed_memory, g1_cur], dim=1)
-            full_ln = layer.input_layernorm(full_in)
-            sa = layer.self_attn
-
-            input_shape = full_ln.shape[:-1]
-            hidden_shape = (*input_shape, -1, sa.head_dim)
-            q_full = sa.q_proj(full_ln).view(hidden_shape)
-            k_full = sa.k_proj(full_ln).view(hidden_shape)
-            v_full = sa.v_proj(full_ln).view(hidden_shape)
-            if hasattr(sa, "q_norm"):
-                q_full = sa.q_norm(q_full)
-            if hasattr(sa, "k_norm"):
-                k_full = sa.k_norm(k_full)
-
-            q_full = q_full.transpose(1, 2).contiguous()
-            k_full = k_full.transpose(1, 2).contiguous()
-            v_full = v_full.transpose(1, 2).contiguous()
-
-            full_pos_emb = self.rotary_emb(full_in, position_ids_ns)
-            cos, sin = full_pos_emb
-            q_full, k_full = self._apply_rotary_fn(q_full, k_full, cos, sin, unsqueeze_dim=1)
-            q_g1 = q_full[:, :, fixed_len:, :]
-
-            n_heads = int(q_g1.shape[1])
-            n_kv_heads = int(k_full.shape[1])
-            if n_heads % n_kv_heads != 0:
-                raise ValueError(f"GQA requires num_heads % num_kv_heads == 0; got {n_heads} % {n_kv_heads}")
-            n_rep = n_heads // n_kv_heads
-            k_attn = (
-                k_full
-                if n_rep == 1
-                else k_full[:, :, None, :, :]
-                .expand(k_full.shape[0], k_full.shape[1], n_rep, k_full.shape[2], k_full.shape[3])
-                .reshape(k_full.shape[0], k_full.shape[1] * n_rep, k_full.shape[2], k_full.shape[3])
+        with _force_sdpa_attn_context(self.config):
+            out = self._decoder_forward(
+                hidden_states_ms,
+                position_ids_ms,
+                attention_mask_ms,
+                past_key_values=None,
+                use_cache=False,
             )
-            v_attn = (
-                v_full
-                if n_rep == 1
-                else v_full[:, :, None, :, :]
-                .expand(v_full.shape[0], v_full.shape[1], n_rep, v_full.shape[2], v_full.shape[3])
-                .reshape(v_full.shape[0], v_full.shape[1] * n_rep, v_full.shape[2], v_full.shape[3])
-            )
-
-            dropout_p = float(getattr(sa, "attention_dropout", 0.0)) if self.training else 0.0
-            attn_out = F.scaled_dot_product_attention(
-                q_g1,
-                k_attn,
-                v_attn,
-                attn_mask=attention_mask_g1_to_ns,
-                dropout_p=dropout_p,
-                is_causal=False,
-            )
-            attn_out = attn_out.transpose(1, 2).contiguous().reshape(bsz, s, -1)
-            attn_out = sa.o_proj(attn_out)
-
-            g1_after_attn = g1_cur + attn_out
-            g1_cur = g1_after_attn + layer.mlp(layer.post_attention_layernorm(g1_after_attn))
-
-        return g1_cur
+        return out[:, (m - 1) * s :, :]
 
     def forward_with_rotary(self, *args, **kwargs) -> torch.Tensor:
-        # Backward-compatible alias used by existing inference code paths.
-        return self.forward_inference_g1_only_with_rotary(*args, **kwargs)
+        return self.forward_inference_with_rotary(*args, **kwargs)
 
 
-class Qwen3SpeculativePipelineModel(nn.Module):
+def default_aggr_feature_bound(num_layers: int, num_stages: int) -> List[int]:
+    """Default ``aggr_feature_bound`` for ``num_layers`` and ``num_stages`` (see ``结构v11.md``)."""
+    n = int(num_stages)
+    l = int(num_layers)
+    if n < 1:
+        raise ValueError(f"num_stages must be >= 1, got {n}")
+    if l % n != 0:
+        raise ValueError(f"num_layers ({l}) must be divisible by num_stages ({n})")
+    lps = l // n
+    raw = [0, lps, 3 * lps, 6 * lps, l - 1]
+    return sorted({max(0, min(l, int(x))) for x in raw})
+
+
+class Qwen3PipelineModelV11(nn.Module):
     def __init__(
         self,
         base_model: PreTrainedModel,
@@ -782,7 +696,7 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         num_spec_layers: int = 1,
         spec_init_from_base_layers: Optional[Sequence[int]] = None,
         draft_token_ids: Optional[Sequence[int]] = None,
-        shallow_hidden_layer_indices: Optional[Sequence[Sequence[int]]] = None,
+        aggr_feature_bound: Optional[Sequence[int]] = None,
         trained_with_use_deepest: bool = False,
     ):
         super().__init__()
@@ -821,7 +735,13 @@ class Qwen3SpeculativePipelineModel(nn.Module):
                 if j < 0 or j >= self.num_layers:
                     raise ValueError(f"spec_init_from_base_layers entry out of range: {j}")
 
-        self.shallow_hidden_layer_indices = self._normalize_stage_feature_indices(shallow_hidden_layer_indices)
+        self.aggr_feature_bound = self._normalize_aggr_feature_bound(aggr_feature_bound)
+        self.num_aggr_types = len(self.aggr_feature_bound)
+        self.aggr_feature_indices = [
+            tuple(self.aggr_feature_bound[: i + 1]) for i in range(self.num_aggr_types)
+        ]
+        self.stage_depth_to_aggr_idx = [self._depth_to_aggr_idx(d) for d in range(self.num_stages + 1)]
+        self.aggr_to_min_depth = self._compute_aggr_to_min_depth()
 
         v_full = int(dec_cfg.vocab_size)
         if draft_token_ids is None:
@@ -845,13 +765,14 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             self.register_buffer("_token_id_to_draft_idx", to_draft, persistent=True)
 
         spec_cfg = _speculation_attn_config(dec_cfg)
-        self.speculation_module = SpeculationHeadTransformer(
+        self.speculation_module = SpeculationTransformerModuleV11(
             spec_cfg,
             self.dtype,
             self.device,
             base_rotary_emb=self.base_model.model.rotary_emb,
             apply_rotary_fn=_get_apply_rotary_pos_emb(self.config),
-            stage_feature_hf_indices=self.shallow_hidden_layer_indices,
+            aggr_feature_indices=self.aggr_feature_indices,
+            num_aggr_types=self.num_aggr_types,
             num_spec_layers=self.num_spec_layers,
             init_weights_from_base_layer_indices=self.spec_init_from_base_layers,
             base_decoder_layers=self.base_model.model.layers if self.spec_init_from_base_layers is not None else None,
@@ -895,82 +816,61 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         return self.base_model.model.rotary_emb
 
     @property
-    def speculation_head(self) -> SpeculationHeadTransformer:
+    def speculation_head(self) -> SpeculationTransformerModuleV11:
         return self.speculation_module
 
-    def _default_stage_feature_indices(self) -> List[Tuple[int, ...]]:
-        """
-        HF ``hidden_states`` indices: ``0`` = embeddings, ``k>=1`` = output after layer ``k-1``.
-
-        - ``g_1``: ``h[0]``, ``h[lps]``
-        - ``g_2``: ``h[0]``, ``h[lps]``, ``h[lps*2]``
-        - ``g_i`` (``i>=3``): ``h[0]``, ``h[lps*i//3]``, ``h[lps*i//3*2]``, ``h[lps*i]``,
-          every listed ``h[·]`` index is clamped to ``[0, min(num_layers, n*lps-2)]``.
-
-        Rows are ordered ``g_n, g_{n-1}, ..., g_1`` (same as ``shallow_hidden_layer_indices``).
-        """
-        n = self.num_stages
-        l = self.num_layers
-        lps = self.layers_per_stage
-
-        cap_hf = min(int(l), int(n) * int(lps) - 2)
-
-        def clamp_hf(x: int) -> int:
-            return max(0, min(int(x), cap_hf, int(l)))
-
-        def indices_for_stage_i(i: int) -> Tuple[int, ...]:
-            if i == 1:
-                raw = (0, int(lps))
-            elif i == 2:
-                raw = (0, int(lps), int(lps) * 2)
-            else:
-                ii = int(i)
-                li = int(lps) * ii
-                q = li // 3
-                raw = (0, q, q * 2, li)
-            clamped = tuple(sorted({clamp_hf(int(x)) for x in raw}))
-            return clamped
-
-        rows: List[Tuple[int, ...]] = []
-        for i in range(n, 0, -1):
-            rows.append(indices_for_stage_i(i))
-        return rows
-
-    def _normalize_stage_feature_indices(
+    def _normalize_aggr_feature_bound(
         self,
-        shallow_hidden_layer_indices: Optional[Sequence[Sequence[int]]],
-    ) -> List[Tuple[int, ...]]:
-        if shallow_hidden_layer_indices is None:
-            rows = self._default_stage_feature_indices()
+        aggr_feature_bound: Optional[Sequence[int]],
+    ) -> List[int]:
+        if aggr_feature_bound is None:
+            bounds = default_aggr_feature_bound(self.num_layers, self.num_stages)
         else:
-            rows = [tuple(int(x) for x in row) for row in shallow_hidden_layer_indices]
-
-        if len(rows) != self.num_stages:
+            bounds = [int(x) for x in aggr_feature_bound]
+        if not bounds:
+            raise ValueError("aggr_feature_bound must be non-empty.")
+        if bounds[0] != 0:
+            raise ValueError(f"aggr_feature_bound must start with 0, got {bounds[0]}")
+        max_hf = self.num_layers
+        out: List[int] = []
+        prev = -1
+        for j in bounds:
+            if j < 0 or j > max_hf:
+                raise ValueError(
+                    f"aggr_feature_bound entry {j} out of range [0, {max_hf}]"
+                )
+            if j <= prev:
+                raise ValueError(f"aggr_feature_bound must be strictly increasing, got {bounds}")
+            out.append(int(j))
+            prev = j
+        if len(out) > self.num_stages + 1:
             raise ValueError(
-                f"shallow_hidden_layer_indices must have length num_stages={self.num_stages}, got {len(rows)}"
+                f"aggr_feature_bound length {len(out)} exceeds num_stages+1={self.num_stages + 1}"
             )
-        max_hf_idx = self.num_layers
-        out: List[Tuple[int, ...]] = []
-        for i, row in enumerate(rows):
-            if len(row) < 1:
-                raise ValueError(f"shallow_hidden_layer_indices[{i}] must be non-empty.")
-            checked: List[int] = []
-            for j in row:
-                if j < 0 or j > max_hf_idx:
-                    raise ValueError(
-                        f"shallow_hidden_layer_indices[{i}] has invalid hidden-state index {j}; "
-                        f"expected range [0, {max_hf_idx}]"
-                    )
-                checked.append(int(j))
-            out.append(tuple(checked))
+        return out
+
+    def _depth_to_available_hs_index(self, depth: int) -> int:
+        return min(self.num_layers, int(depth) * self.layers_per_stage)
+
+    def _depth_to_aggr_idx(self, depth: int) -> int:
+        avail = self._depth_to_available_hs_index(depth)
+        idx = 0
+        for i, bound in enumerate(self.aggr_feature_bound):
+            if int(bound) <= avail:
+                idx = i
+        return idx
+
+    def _compute_aggr_to_min_depth(self) -> List[int]:
+        m = self.num_aggr_types
+        out = [self.num_stages + 1] * m
+        for d in range(self.num_stages + 1):
+            ai = self.stage_depth_to_aggr_idx[d]
+            if d < out[ai]:
+                out[ai] = d
         return out
 
     def _snap_indices_needed(self) -> Set[int]:
-        want: Set[int] = set()
-        for row in self.shallow_hidden_layer_indices:
-            for idx in row:
-                want.add(int(idx))
-        return want
+        return set(int(x) for x in self.aggr_feature_bound)
 
     def _initial_pipeline_snap(self, hs: torch.Tensor) -> Dict[int, torch.Tensor]:
         """HF index ``0`` is embedding output; capture it when the pipeline entry is created."""
@@ -988,67 +888,77 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         vecs = [all_hs[int(idx)] for idx in hf_indices]
         return proj(torch.cat(vecs, dim=-1))
 
+    def _normalize_simulated_pipeline_fill(self, simulated_pipeline_fill: Optional[int]) -> int:
+        n = self.num_stages
+        if simulated_pipeline_fill is None:
+            return n
+        fill = int(simulated_pipeline_fill)
+        if fill < 1 or fill > n:
+            raise ValueError(f"simulated_pipeline_fill must be in [1, {n}], got {fill}")
+        return fill
+
     def _build_training_expanded_inputs(
         self,
         all_hs: Tuple[torch.Tensor, ...],
         simulated_pipeline_fill: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        v10 training layout (``n+1`` blocks of length ``S``), stage-major:
-        ``[g_n, g_{n-1}, ..., g_1, g_0]``; ``g_0`` 仅由 ``all_hs[0]``（embedding）经 ``g0_proj`` FC 得到。
+        v11 training layout (``m`` blocks of length ``S``), stage-major: ``[g_{m-1}, ..., g_0]``.
+        Each block uses ``aggr_projs[i]`` over ``aggr_feature_indices[i]`` from teacher hidden states.
 
-        Let ``fill = simulated_pipeline_fill`` and ``a = n - fill``. For blocks ``b=1..n-1``
-        (i.e. nominal ``g_{n-b}`` with ``b`` in ``1..n-1``), when ``b <= a`` reuse the fused ``g_n``
-        row; otherwise use the staircase row ``fused_rows[b]``. Block ``0`` is always ``g_n``;
-        block ``n`` is always ``g_0``.
+        ``simulated_pipeline_fill`` only affects the training attention mask (see
+        ``_build_pipeline_training_mask_v11``); tensor layout is unchanged for all fill values.
         """
-        n = self.num_stages
-        if simulated_pipeline_fill is None:
-            fill = n
-        else:
-            fill = int(simulated_pipeline_fill)
-            if fill < 1 or fill > n:
-                raise ValueError(
-                    f"simulated_pipeline_fill must be in [1, {n}], got {fill}"
-                )
-
-        fused_rows: List[torch.Tensor] = []
-        for block in range(self.num_stages):
-            fused_rows.append(
+        m = self.num_aggr_types
+        rows: List[torch.Tensor] = []
+        for aggr_i in range(m - 1, -1, -1):
+            rows.append(
                 self._fuse_from_hf_indices(
                     all_hs,
-                    self.shallow_hidden_layer_indices[block],
-                    self.speculation_module.stage_projs[block],
+                    self.aggr_feature_indices[aggr_i],
+                    self.speculation_module.aggr_projs[aggr_i],
                 )
             )
-        g0_row = self.speculation_module.g0_proj(all_hs[0])
-
-        a = n - fill
-        rows: List[torch.Tensor] = []
-        rows.append(fused_rows[0])
-        for b in range(1, n):
-            if b <= a:
-                rows.append(fused_rows[0])
-            else:
-                rows.append(fused_rows[b])
-        rows.append(g0_row)
         return torch.cat(rows, dim=1)
 
     def _build_inference_row_from_snap(
         self,
         snap: Dict[int, torch.Tensor],
-        i_stages: int,
+        depth: int,
     ) -> torch.Tensor:
-        # i_stages: n..1. stage_feature_hf_indices is ordered [g_n..g_1].
-        block = self.num_stages - i_stages
-        hf_indices = self.shallow_hidden_layer_indices[block]
-        proj = self.speculation_module.stage_projs[block]
+        aggr_i = self.stage_depth_to_aggr_idx[int(depth)]
+        hf_indices = self.aggr_feature_indices[aggr_i]
+        proj = self.speculation_module.aggr_projs[aggr_i]
         vecs = [snap[int(idx)] for idx in hf_indices]
         return proj(torch.cat(vecs, dim=-1))
 
     def _build_inference_g0_row_from_hs(self, hs: torch.Tensor) -> torch.Tensor:
-        """``g_0``：当前 token 的 embedding（``[B,1,H]``）经 ``g0_proj`` FC 后再作为 speculation 输入。"""
-        return self.speculation_module.g0_proj(hs)
+        return self._build_inference_row_from_snap({0: hs}, depth=0)
+
+    def _choose_inference_depth_for_snap(
+        self,
+        snap: Dict[int, torch.Tensor],
+        nominal_depth: int,
+        use_deepest: bool,
+        *,
+        search_hi: Optional[int] = None,
+    ) -> int:
+        n = self.num_stages
+        nd = int(nominal_depth)
+        if nd <= 0:
+            return nd
+        if not use_deepest:
+            hi = nd
+        else:
+            hi = int(search_hi) if search_hi is not None else n
+            if hi > n:
+                hi = n
+        for d in range(hi, -1, -1):
+            aggr_i = self.stage_depth_to_aggr_idx[d]
+            hf_indices = self.aggr_feature_indices[aggr_i]
+            if all(int(idx) in snap for idx in hf_indices):
+                return d
+        return nd
 
     def _choose_inference_i_stages_for_snap(
         self,
@@ -1058,30 +968,9 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         *,
         search_hi: Optional[int] = None,
     ) -> int:
-        """
-        Pick which g_{i_stages} block (and matching projection) to use for one speculation row.
-
-        ``i_nominal`` is the layout role before ``use_deepest`` upgrade (larger = deeper in the
-        pipelined window). When ``use_deepest`` is True, upgrade up to ``search_hi`` (default
-        ``num_stages`` = full ``g_n``). Always pick the deepest ``i_stages`` in ``[1, hi]`` whose
-        HF indices are all present in ``snap``; downgrade when snapshots are still partial.
-        """
-        n = self.num_stages
-        inom = int(i_nominal)
-        if inom <= 0:
-            return inom
-        if not use_deepest:
-            hi = inom
-        else:
-            hi = int(search_hi) if search_hi is not None else n
-            if hi > n:
-                hi = n
-        for i_stages in range(hi, 0, -1):
-            block = n - i_stages
-            hf_indices = self.shallow_hidden_layer_indices[block]
-            if all(int(idx) in snap for idx in hf_indices):
-                return i_stages
-        return inom
+        return self._choose_inference_depth_for_snap(
+            snap, i_nominal, use_deepest, search_hi=search_hi
+        )
 
     def _extract_position_snapshots_from_hidden_states(
         self,
@@ -1128,6 +1017,8 @@ class Qwen3SpeculativePipelineModel(nn.Module):
 
         b, s, _ = all_hs[0].shape
         n = self.num_stages
+        m = self.num_aggr_types
+        fill = self._normalize_simulated_pipeline_fill(simulated_pipeline_fill)
         if attention_mask is None:
             attn2d = torch.ones((b, s), device=input_ids.device, dtype=torch.long)
         else:
@@ -1135,20 +1026,29 @@ class Qwen3SpeculativePipelineModel(nn.Module):
 
         spec_hidden = self._build_training_expanded_inputs(
             all_hs,
-            simulated_pipeline_fill=simulated_pipeline_fill,
+            simulated_pipeline_fill=fill,
         )
-        pos_ns = torch.arange(s, device=spec_hidden.device, dtype=torch.long).repeat(n + 1).unsqueeze(0).expand(b, -1)
-        attn_ns = attn2d.repeat(1, n + 1)
-        mask_4d = _build_pipeline_training_mask(attn_ns, n=n, s=s, mask_dtype=self.dtype)
+        pos_ms = torch.arange(s, device=spec_hidden.device, dtype=torch.long).repeat(m).unsqueeze(0).expand(b, -1)
+        attn_ms = attn2d.repeat(1, m)
+        mask_4d = _build_pipeline_training_mask_v11(
+            attn_ms,
+            n=n,
+            m=m,
+            s=s,
+            aggr_to_min_depth=self.aggr_to_min_depth,
+            stage_depth_to_aggr_idx=self.stage_depth_to_aggr_idx,
+            mask_dtype=self.dtype,
+            simulated_pipeline_fill=fill,
+        )
 
-        g1_processed = self.speculation_module.forward_training_g1_only_with_rotary(
+        g0_processed = self.speculation_module.forward_training_with_rotary(
             spec_hidden,
-            pos_ns,
+            pos_ms,
             mask_4d,
-            num_stages=n,
+            num_aggr_types=m,
         )
-        g1_processed = self.final_norm(g1_processed)
-        spec_logits = self.speculation_module.lm_head(g1_processed)
+        g0_processed = self.final_norm(g0_processed)
+        spec_logits = self.speculation_module.lm_head(g0_processed)
 
         teacher_target = teacher_logits.detach()
         if self._use_draft_vocab:
@@ -1581,6 +1481,7 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             acc_timings[0] += iter_stage_sec
             if L_pl > 1:
                 acc_timings[1] += iter_stage_sec * float(L_pl - 1) / float(L_pl)
+
             if use_streams and pipeline:
                 newest_event = pipeline[0].get("ready_event")
                 if newest_event is not None:
@@ -2179,9 +2080,10 @@ class Qwen3SpeculativePipelineModel(nn.Module):
             "draft_vocab_size": self.draft_vocab_size,
             "num_stages": self.num_stages,
             "num_spec_layers": self.num_spec_layers,
-            "version": 10,
+            "num_aggr_types": self.num_aggr_types,
+            "version": 11,
             "trained_with_use_deepest": bool(self.trained_with_use_deepest),
-            "shallow_hidden_layer_indices": [list(x) for x in self.shallow_hidden_layer_indices],
+            "aggr_feature_bound": list(self.aggr_feature_bound),
             "base_model_path": self.base_model_path,
         }
         if self.spec_init_from_base_layers is not None:
@@ -2194,8 +2096,18 @@ class Qwen3SpeculativePipelineModel(nn.Module):
         ckpt = torch.load(path, map_location=map_location)
         if isinstance(ckpt, dict):
             cfg = ckpt.get("config")
-            if isinstance(cfg, dict) and "trained_with_use_deepest" in cfg:
-                self.trained_with_use_deepest = bool(cfg["trained_with_use_deepest"])
+            if isinstance(cfg, dict):
+                if int(cfg.get("version", 0) or 0) not in (0, 11):
+                    raise ValueError(
+                        f"Checkpoint version {cfg.get('version')} is not compatible with Qwen3PipelineModelV11."
+                    )
+                if "trained_with_use_deepest" in cfg:
+                    self.trained_with_use_deepest = bool(cfg["trained_with_use_deepest"])
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         state = _materialize_state_dict_for_load(state, map_location)
         self.speculation_module.load_state_dict(state)
+
+
+# Backward-compatible names used by train / inference scripts in this package.
+Qwen3SpeculativePipelineModel = Qwen3PipelineModelV11
+SpeculationHeadTransformer = SpeculationTransformerModuleV11

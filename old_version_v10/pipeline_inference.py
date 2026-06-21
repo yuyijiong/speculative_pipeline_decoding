@@ -1,11 +1,20 @@
 """
-Utilities and demo for pipelined speculative decoding vs standard ``generate``.
+Utilities and demo for pipelined speculative decoding vs standard ``generate`` (v10, archived).
 
-Checkpoints must have ``config['version'] == 11`` (saved by ``train.py``).
-v10 checkpoints can be loaded via ``old_version_v10/`` (see ``_infer_pipeline_kind``).
+Checkpoints must have ``config['version'] == 10``.
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_v10_dir = Path(__file__).resolve().parent
+_parent_dir = _v10_dir.parent
+for _p in (_parent_dir, _v10_dir):
+    _ps = str(_p)
+    if _ps not in sys.path:
+        sys.path.insert(0, _ps)
 
 import argparse
 import inspect
@@ -130,6 +139,16 @@ def _resolve_base_model_path(
     return model_path
 
 
+def _infer_pipeline_kind(cfg: dict[str, Any]) -> int:
+    """Require checkpoint version 10 (this release)."""
+    ver = int(cfg.get("version", 0) or 0)
+    if ver != 10:
+        raise ValueError(
+            f"Unsupported checkpoint version {ver}; this release expects config['version'] == 10."
+        )
+    return ver
+
+
 def _draft_and_spec_init(cfg: dict[str, Any]) -> tuple[list[int] | None, list[int] | None]:
     raw = cfg.get("draft_token_ids")
     draft_token_ids: list[int] | None
@@ -145,43 +164,21 @@ def _draft_and_spec_init(cfg: dict[str, Any]) -> tuple[list[int] | None, list[in
     return draft_token_ids, spec_init_from_base_layers
 
 
-def _infer_pipeline_kind(cfg: dict[str, Any]) -> int:
-    """Require checkpoint version 11 (this release); version 10 uses ``old_version_v10``."""
-    ver = int(cfg.get("version", 0) or 0)
-    if ver == 10:
-        return 10
-    if ver != 11:
-        raise ValueError(
-            f"Unsupported checkpoint version {ver}; this release expects config['version'] == 11 "
-            "(or 10 via old_version_v10)."
-        )
-    return ver
-
-
-def _pipeline_init_kwargs(cfg: dict[str, Any], *, version: int) -> dict[str, Any]:
+def _pipeline_init_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
     draft_token_ids, spec_init_from_base_layers = _draft_and_spec_init(cfg)
+    raw_shallow = cfg.get("shallow_hidden_layer_indices")
+    shallow_hidden_layer_indices = (
+        [[int(y) for y in x] for x in raw_shallow] if raw_shallow is not None else None
+    )
     kw: dict[str, Any] = {
         "num_stages": int(cfg["num_stages"]),
         "num_spec_layers": int(cfg.get("num_spec_layers", 1)),
         "draft_token_ids": draft_token_ids,
         "spec_init_from_base_layers": spec_init_from_base_layers,
+        "shallow_hidden_layer_indices": shallow_hidden_layer_indices,
     }
     if "trained_with_use_deepest" in cfg:
         kw["trained_with_use_deepest"] = bool(cfg["trained_with_use_deepest"])
-    if version == 11:
-        raw_bound = cfg.get("aggr_feature_bound")
-        if raw_bound is not None:
-            kw["aggr_feature_bound"] = [int(x) for x in raw_bound]
-        from modeling_qwen3_pipeline_v11 import stage_layers_from_spec_cfg
-
-        stage_layers = stage_layers_from_spec_cfg(cfg)
-        if stage_layers is not None:
-            kw["stage_layers"] = stage_layers
-    else:
-        raw_shallow = cfg.get("shallow_hidden_layer_indices")
-        kw["shallow_hidden_layer_indices"] = (
-            [[int(y) for y in x] for x in raw_shallow] if raw_shallow is not None else None
-        )
     return kw
 
 
@@ -191,30 +188,9 @@ def build_pipeline_from_spec_ckpt(
     cfg: dict[str, Any],
     map_location: str,
 ) -> Qwen3SpeculativePipelineModel:
-    """Construct pipeline model and load speculation-head weights."""
-    import importlib.util
-    from pathlib import Path
-
-    version = _infer_pipeline_kind(cfg)
-    kwargs = _pipeline_init_kwargs(cfg, version=version)
-    if version == 10:
-        v10_model = Path(__file__).resolve().parent / "old_version_v10" / "pipeline_model.py"
-        spec = importlib.util.spec_from_file_location("pipeline_model_v10", v10_model)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load v10 pipeline model from {v10_model}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        PipelineCls = mod.Qwen3SpeculativePipelineModel
-        pipeline = PipelineCls(base_model=base_model, **kwargs)
-    else:
-        import sys
-
-        root = Path(__file__).resolve().parent.parent
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from modeling_qwen3_pipeline_v11 import Qwen3PipelineModelV11 as PipelineCls
-
-        pipeline = PipelineCls(base_model=base_model, **kwargs)
+    """Construct ``Qwen3SpeculativePipelineModel`` and load speculation-head weights."""
+    _infer_pipeline_kind(cfg)
+    pipeline = Qwen3SpeculativePipelineModel(base_model=base_model, **_pipeline_init_kwargs(cfg))
     pipeline.load_speculation_head(ckpt_path, map_location=map_location)
     return pipeline
 

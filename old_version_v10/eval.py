@@ -9,7 +9,7 @@ of user turns; we take **only the first turn** as the prompt (one generation per
 Runs always use verification (`verify=True`) so text follows the base-model
 decision path under the selected decoding mode.
 
-**Timing:** v10/v11 set ``_last_generate_timing`` (prefill vs decode split, per-stage GPU
+**Timing:** v9/v10 set ``_last_generate_timing`` (prefill vs decode split, per-stage GPU
 time, ideal parallel decode). v5/v6/v7/v8 record only total wall time in
 ``run_pipeline_generate``; per-sample ``pipeline_decode_wall_sec`` falls back to that
 wall time when split timing is missing. With ``--baseline``

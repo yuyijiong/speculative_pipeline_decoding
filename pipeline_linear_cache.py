@@ -85,6 +85,16 @@ class PipelineLinearAttentionLayer(LinearAttentionLayer):
         if overflow > 0:
             del self._snapshot_buffer[:overflow]
 
+    def seed_snapshot_from_current_state(self) -> None:
+        """Record the live conv/recurrent tensors as the sole snapshot (post-prefill / post-rewind)."""
+        if not (self.is_conv_states_initialized or self.is_recurrent_states_initialized):
+            self._snapshot_buffer.clear()
+            return
+        if not self.has_previous_state:
+            self._snapshot_buffer.clear()
+            return
+        self._snapshot_buffer = [_capture_linear_snapshot(self)]
+
     def update_conv_state(self, conv_states: torch.Tensor, **kwargs) -> torch.Tensor:
         out = super().update_conv_state(conv_states, **kwargs)
         return out
@@ -100,6 +110,7 @@ class PipelineLinearAttentionLayer(LinearAttentionLayer):
         if rewind_steps < 0:
             raise ValueError(f"rewind_steps must be >= 0, got {rewind_steps}.")
         if rewind_steps == 0:
+            self.seed_snapshot_from_current_state()
             return
         # Buffer[-1] is the current post-update state; go back k steps via buffer[-(k+1)].
         if len(self._snapshot_buffer) < rewind_steps + 1:
@@ -110,7 +121,7 @@ class PipelineLinearAttentionLayer(LinearAttentionLayer):
             )
         snap = self._snapshot_buffer[-(rewind_steps + 1)]
         _restore_linear_snapshot(self, snap)
-        del self._snapshot_buffer[-(rewind_steps + 1) :]
+        self.seed_snapshot_from_current_state()
 
     def crop(self, max_length: int) -> None:
         """HF ``DynamicCache.crop`` entry point; linear layers ignore sequence length."""
@@ -153,6 +164,15 @@ class PipelineLinearAttentionAndFullAttentionLayer(LinearAttentionAndFullAttenti
         if overflow > 0:
             del self._snapshot_buffer[:overflow]
 
+    def seed_snapshot_from_current_state(self) -> None:
+        if not (self.is_conv_states_initialized or self.is_recurrent_states_initialized):
+            self._snapshot_buffer.clear()
+            return
+        if not self.has_previous_state:
+            self._snapshot_buffer.clear()
+            return
+        self._snapshot_buffer = [_capture_linear_snapshot(self)]
+
     def update_conv_state(self, conv_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return LinearAttentionLayer.update_conv_state(self, conv_states, **kwargs)
 
@@ -166,6 +186,7 @@ class PipelineLinearAttentionAndFullAttentionLayer(LinearAttentionAndFullAttenti
         if rewind_steps < 0:
             raise ValueError(f"rewind_steps must be >= 0, got {rewind_steps}.")
         if rewind_steps == 0:
+            self.seed_snapshot_from_current_state()
             return
         if len(self._snapshot_buffer) < rewind_steps + 1:
             raise RuntimeError(
@@ -175,7 +196,7 @@ class PipelineLinearAttentionAndFullAttentionLayer(LinearAttentionAndFullAttenti
             )
         snap = self._snapshot_buffer[-(rewind_steps + 1)]
         _restore_linear_snapshot(self, snap)
-        del self._snapshot_buffer[-(rewind_steps + 1) :]
+        self.seed_snapshot_from_current_state()
 
     def crop(self, max_length: int) -> None:
         DynamicLayer.crop(self, max_length)
@@ -286,12 +307,6 @@ def crop_pipeline_cache_after_rejection(
                 DynamicLayer.crop(layer, target_length)
         elif layer_idx not in linear_set:
             layer.crop(target_length)
-    for layer_idx in linear_set:
-        layer = past_kv.layers[layer_idx]
-        if isinstance(
-            layer, (PipelineLinearAttentionLayer, PipelineLinearAttentionAndFullAttentionLayer)
-        ):
-            layer.clear_snapshot_history()
 
 
 def make_pipeline_dynamic_cache(config: Any, num_stages: int) -> DynamicCache:

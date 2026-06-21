@@ -1,8 +1,18 @@
 """
-Train the speculation head for pipelined speculative decoding (v11).
+Train the speculation head for pipelined speculative decoding on Qwen3 models (v10, archived).
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_v10_dir = Path(__file__).resolve().parent
+_parent_dir = _v10_dir.parent
+for _p in (_parent_dir, _v10_dir):
+    _ps = str(_p)
+    if _ps not in sys.path:
+        sys.path.insert(0, _ps)
 
 import argparse
 import hashlib
@@ -27,11 +37,7 @@ from transformers import (
 )
 from transformers.trainer_pt_utils import LengthGroupedSampler, get_length_grouped_indices
 
-from pipeline_model import (
-    Qwen3SpeculativePipelineModel,
-    default_aggr_feature_bound,
-    num_hidden_layers_from_hf_config,
-)
+from pipeline_model import Qwen3SpeculativePipelineModel, num_hidden_layers_from_hf_config
 
 setproctitle.setproctitle("speculative_pipeline_train")
 
@@ -42,7 +48,7 @@ log = logging.getLogger(__name__)
 os.environ["WANDB_PROJECT"] = "pipeline_decoding"
 os.environ["WANDB_MODE"] = "offline"
 
-ENCODE_PIPELINE_CACHE_VERSION = "v11-encode-1"
+ENCODE_PIPELINE_CACHE_VERSION = "spd-encode-1"
 
 DEFAULT_TRAIN_DATA_PATHS: List[str] = []
 
@@ -61,10 +67,22 @@ def _parse_optional_int_list(s: Optional[str]) -> Optional[List[int]]:
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
 
 
-def _parse_aggr_feature_bound(s: Optional[str]) -> List[int]:
+def _parse_hidden_index_sets(s: Optional[str], *, num_stages: int) -> List[Tuple[int, ...]]:
     if s is None or not str(s).strip():
-        raise ValueError("--aggr_feature_bound is required when not using auto mode.")
-    return [int(x.strip()) for x in str(s).split(",") if x.strip()]
+        raise ValueError("--shallow_hidden_layer_indices is required when not using auto mode.")
+    rows = []
+    for part in str(s).split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        row = tuple(int(x.strip()) for x in part.split(",") if x.strip())
+        rows.append(row)
+    if len(rows) != int(num_stages):
+        raise ValueError(
+            f"--shallow_hidden_layer_indices must provide {num_stages} groups; got {len(rows)}. "
+            "Expected format: g_n;g_{n-1};...;g_1, each group is comma-separated indices."
+        )
+    return rows
 
 
 def init_speculation_lm_head_from_base(pipeline_model: Qwen3SpeculativePipelineModel) -> None:
@@ -274,68 +292,6 @@ class SpeculationHeadTrainer(Trainer):
             self._aux_kl_sum = self._aux_total_sum = self._aux_acc_sum = 0.0
             self._aux_n = 0
         super().log(logs, start_time=start_time)
-
-
-class SpeculationHeadTrainerWrapper(nn.Module):
-    def __init__(
-        self,
-        pipeline_model: Qwen3SpeculativePipelineModel,
-        temperature: float = 1.0,
-        trained_with_use_deepest: bool = False,
-    ):
-        super().__init__()
-        object.__setattr__(self, "pipeline_model", pipeline_model)
-        self.temperature = temperature
-        self.trained_with_use_deepest = bool(trained_with_use_deepest)
-        self.speculation_head = pipeline_model.speculation_head
-
-    def _sample_simulated_pipeline_fill(self, *, device: torch.device) -> int:
-        n = int(self.pipeline_model.num_stages)
-        if (not self.trained_with_use_deepest) or n <= 1:
-            return n
-
-        fill = torch.empty(1, device=device, dtype=torch.long)
-        dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
-
-        def _sample_local() -> int:
-            use_staircase = bool((torch.rand((), device=device) < 0.5).item())
-            if use_staircase:
-                return n
-            return int(torch.randint(1, n, (1,), device=device, dtype=torch.long).item())
-
-        if dist_ready:
-            if torch.distributed.get_rank() == 0:
-                fill.fill_(_sample_local())
-            torch.distributed.broadcast(fill, src=0)
-        else:
-            fill.fill_(_sample_local())
-        return int(fill.item())
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Dict[str, torch.Tensor]:
-        embed_device = self.pipeline_model.embed_tokens.weight.device
-        input_ids = input_ids.to(embed_device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(embed_device)
-        if labels is not None:
-            labels = labels.to(embed_device)
-
-        simulated_pipeline_fill = kwargs.pop("simulated_pipeline_fill", None)
-        if simulated_pipeline_fill is None:
-            simulated_pipeline_fill = self._sample_simulated_pipeline_fill(device=embed_device)
-
-        return self.pipeline_model.training_forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            temperature=self.temperature,
-            simulated_pipeline_fill=int(simulated_pipeline_fill),
-        )
 
 
 def _qwen35_plain_user_query_ok(messages: List[Dict[str, str]]) -> bool:
@@ -642,15 +598,57 @@ def encode_raw_to_filtered_dataset(
     return encoded_ds
 
 
-def _aggr_bound_arg_means_auto(s: Optional[str]) -> bool:
+def _shallow_hidden_arg_means_auto(s: Optional[str]) -> bool:
     if s is None:
         return True
     t = str(s).strip().lower()
     return t in ("", "none", "auto")
 
 
-def compute_auto_aggr_feature_bound(num_layers: int, num_stages: int) -> List[int]:
-    return default_aggr_feature_bound(num_layers, num_stages)
+def compute_auto_shallow_hidden_layer_indices(
+    num_layers: int, num_stages: int
+) -> List[Tuple[int, ...]]:
+    """
+    HF hidden-state indices (same convention as ``Qwen3SpeculativePipelineModel._default_stage_feature_indices``):
+    ``0`` = embedding output; ``k>=1`` = output after layer ``k-1``.
+
+    Rows follow ``[g_n, g_{n-1}, ..., g_1]``. Stage ``i`` is 1-indexed from shallow (``g_1``) to deep (``g_n``).
+
+    Let ``lps = num_layers // num_stages``. Then:
+      ``g_1``: ``h[0]``, ``h[lps]``
+      ``g_2``: ``h[0]``, ``h[lps]``, ``h[lps*2]``
+      ``g_i`` (``i>=3``): ``h[0]``, ``h[lps*i//3]``, ``h[lps*i//3*2]``, ``h[lps*i]``,
+      each clamped like ``Qwen3SpeculativePipelineModel`` (``min(num_layers, n*lps-1)`` and non-negative).
+    """
+    n = int(num_stages)
+    l = int(num_layers)
+    if n < 1:
+        raise ValueError(f"num_stages must be >= 1, got {n}")
+    if l % n != 0:
+        raise ValueError(f"num_layers ({l}) must be divisible by num_stages ({n})")
+    lps = l // n
+    cap_hf = min(l, n * lps - 1)
+
+    def clamp_hf(x: int) -> int:
+        return max(0, min(int(x), cap_hf, l))
+
+    def indices_for_stage_i(i_user: int) -> Tuple[int, ...]:
+        if i_user == 1:
+            raw = (0, int(lps))
+        elif i_user == 2:
+            raw = (0, int(lps), int(lps) * 2)
+        else:
+            ii = int(i_user)
+            li = int(lps) * ii
+            q = li // 3
+            raw = (0, q, q * 2, li)
+        return tuple(sorted({clamp_hf(int(x)) for x in raw}))
+
+    rows: List[Tuple[int, ...]] = []
+    for r in range(n):
+        i_user = n - r
+        rows.append(indices_for_stage_i(i_user))
+    return rows
 
 
 def auto_output_dir(
@@ -704,10 +702,9 @@ def save_speculation_head_checkpoint(
                     "draft_vocab_size": getattr(pm, "draft_vocab_size", pm.vocab_size),
                     "num_stages": pm.num_stages,
                     "num_spec_layers": pm.num_spec_layers,
-                    "version": 11,
+                    "version": 10,
                     "trained_with_use_deepest": bool(getattr(pm, "trained_with_use_deepest", False)),
-                    "aggr_feature_bound": list(pm.aggr_feature_bound),
-                    "num_aggr_types": int(pm.num_aggr_types),
+                    "shallow_hidden_layer_indices": [list(x) for x in pm.shallow_hidden_layer_indices],
                     **(
                         {"spec_init_from_base_layers": pm.spec_init_from_base_layers}
                         if getattr(pm, "spec_init_from_base_layers", None)
@@ -729,19 +726,81 @@ def save_speculation_head_checkpoint(
     log.info("Saved speculation head checkpoint -> %s", path)
 
 
+class SpeculationHeadTrainerWrapper(nn.Module):
+    def __init__(
+        self,
+        pipeline_model: Qwen3SpeculativePipelineModel,
+        temperature: float = 1.0,
+        trained_with_use_deepest: bool = False,
+    ):
+        nn.Module.__init__(self)
+        object.__setattr__(self, "pipeline_model", pipeline_model)
+        self.temperature = temperature
+        self.trained_with_use_deepest = bool(trained_with_use_deepest)
+        self.speculation_head = pipeline_model.speculation_head
+
+    def _sample_simulated_pipeline_fill(self, *, device: torch.device) -> int:
+        n = int(self.pipeline_model.num_stages)
+        if (not self.trained_with_use_deepest) or n <= 1:
+            return n
+
+        fill = torch.empty(1, device=device, dtype=torch.long)
+        dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        def _sample_local() -> int:
+            use_staircase = bool((torch.rand((), device=device) < 0.5).item())
+            if use_staircase:
+                return n
+            return int(torch.randint(1, n, (1,), device=device, dtype=torch.long).item())
+
+        if dist_ready:
+            if torch.distributed.get_rank() == 0:
+                fill.fill_(_sample_local())
+            torch.distributed.broadcast(fill, src=0)
+        else:
+            fill.fill_(_sample_local())
+        return int(fill.item())
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        embed_device = self.pipeline_model.embed_tokens.weight.device
+        input_ids = input_ids.to(embed_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(embed_device)
+        if labels is not None:
+            labels = labels.to(embed_device)
+
+        simulated_pipeline_fill = kwargs.pop("simulated_pipeline_fill", None)
+        if simulated_pipeline_fill is None:
+            simulated_pipeline_fill = self._sample_simulated_pipeline_fill(device=embed_device)
+
+        return self.pipeline_model.training_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            temperature=self.temperature,
+            simulated_pipeline_fill=int(simulated_pipeline_fill),
+        )
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train speculation head for pipelined speculative decoding (v11)")
+    p = argparse.ArgumentParser(description="Train speculation head for pipelined speculative decoding")
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3.5-4B")
     p.add_argument("--data_path", action="append", default=None, metavar="PATH")
     p.add_argument("--num_stages", type=int, default=8)
     p.add_argument("--num_spec_layers", type=int, default=4)
     p.add_argument("--spec_init_from_base_layers", type=str, default=None)#"18,24,29,33")
     p.add_argument(
-        "--aggr_feature_bound",
+        "--shallow_hidden_layer_indices",
         type=str,
-        default="0,8,16,24,31",
-        help="Comma-separated HF hidden-state anchor indices for g_0..g_{m-1}. Empty, 'none', or 'auto' "
-        "enables automatic bounds from decoder layer count and num_stages (see compute_auto_aggr_feature_bound).",
+        default=None,
+        help="Semicolon-separated stage groups for [g_n..g_1]. Empty, 'none', or 'auto' "
+        "enables automatic indices from decoder layer count and num_stages (see compute_auto_shallow_hidden_layer_indices).",
     )
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=4)
@@ -762,7 +821,12 @@ def parse_args() -> argparse.Namespace:
         help="Subdirectory under --output_dir where Weights & Biases stores run data (WANDB_DIR).",
     )
     p.add_argument("--output_dir", type=str, default=None)
-    p.add_argument("--draft_vocab_json", type=str, default="")
+    p.add_argument(
+        "--draft_vocab_json",
+        type=str,
+        default="",
+        help="Optional JSON with draft_token_ids; empty string disables draft vocabulary.",
+    )
     p.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     p.add_argument("--chat_template_dir", type=str, default=".")
     p.add_argument("--encoded_dataset_cache_dir", type=str, default="./dataset_cache/pipeline_spd_encoded")
@@ -792,16 +856,20 @@ def main() -> None:
 
     hf_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     num_dec_layers = num_hidden_layers_from_hf_config(hf_config)
-    if _aggr_bound_arg_means_auto(args.aggr_feature_bound):
-        aggr_feature_bound = compute_auto_aggr_feature_bound(num_dec_layers, args.num_stages)
+    if _shallow_hidden_arg_means_auto(args.shallow_hidden_layer_indices):
+        shallow_hidden_layer_indices = compute_auto_shallow_hidden_layer_indices(
+            num_dec_layers, args.num_stages
+        )
         log.info(
-            "Auto aggr_feature_bound (num_layers=%s, num_stages=%s): %s",
+            "Auto shallow_hidden_layer_indices (num_layers=%s, num_stages=%s): %s",
             num_dec_layers,
             args.num_stages,
-            aggr_feature_bound,
+            shallow_hidden_layer_indices,
         )
     else:
-        aggr_feature_bound = _parse_aggr_feature_bound(args.aggr_feature_bound)
+        shallow_hidden_layer_indices = _parse_hidden_index_sets(
+            args.shallow_hidden_layer_indices, num_stages=args.num_stages
+        )
 
     model_type = getattr(hf_config, "model_type", None)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
@@ -830,7 +898,7 @@ def main() -> None:
         num_spec_layers=args.num_spec_layers,
         spec_init_from_base_layers=spec_init_from_base,
         draft_token_ids=draft_token_ids,
-        aggr_feature_bound=aggr_feature_bound,
+        shallow_hidden_layer_indices=shallow_hidden_layer_indices,
         trained_with_use_deepest=args.trained_with_use_deepest,
     )
     init_speculation_lm_head_from_base(pipeline_model)
@@ -899,7 +967,7 @@ def main() -> None:
     bundle_dir = os.path.join(cache_root, fingerprint)
     encoded_disk_path = os.path.join(bundle_dir, "encoded_dataset")
     manifest_path = os.path.join(bundle_dir, "manifest.json")
-    with training_args.main_process_first(desc="pipeline v11 dataset preprocessing"):
+    with training_args.main_process_first(desc="pipeline dataset preprocessing"):
         if training_args.local_process_index == 0:
             if args.force_rebuild_encoded_cache and os.path.isdir(bundle_dir):
                 shutil.rmtree(bundle_dir)
@@ -947,4 +1015,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
