@@ -6,6 +6,10 @@ Original implementation of [**Speculative Pipeline Decoding: Higher-Accruacy and
 >
 > This repository is intended to **demonstrate algorithmic correctness** only. It has **not** been tuned for production performance: there is no system-level optimization, no integration with dedicated inference engines (e.g. vLLM, sglang), and the reference implementation still contains many **sequential** steps on the Python side. As a result, **wall-clock latency can be higher than standard autoregressive decoding** in this codebase, even when acceptance rates look favorable. Reported speedup metrics in `eval.py` is theoretical; treat measured end-to-end time here as a correctness baseline, not a deployment benchmark.
 
+> **Paper vs. code**
+>
+> The [arXiv paper](https://arxiv.org/abs/2605.30852) was written against the **v10** speculation-head design (`shallow_hidden_layer_indices`, `(n+1)·S` training layout, `g_0`-only query). This repository's **`main` branch is v11** (`pipeline_model.py`, `train.py`, etc.). The method overview below and the paper figure describe the same high-level pipeline schedule (target pipeline step and speculation in parallel, verify / rollback); differences are in how aggregated features `g_k` are defined, configured, and fed into the speculation module. To reproduce the paper's v10 setup, use `old_version_v10/`; for current checkpoints on [Hugging Face](https://huggingface.co/yuyijiong/speculative_pipeline_decoding), use the top-level v11 scripts.
+
 ## Method overview
 ![Method](method.png)
 The architecture of Speculative Pipeline Decoding when the number of stages is 3. The target LLM is partitioned into 3 stages. At the start point of this round, tokens (e.g., $x_5$ to $x_7$) reside in the pipeline at varying depths while others (e.g., $x_1$ to $x_4$) are fully processed tokens. For each token, hidden states from passed stages are projected via FC layers to form an aggregated feature, serving as the input to the Pipeline Speculation Module. The Speculation Module speculates the next token ($x_8$) simultaneously with the target LLM's pipeline forward step. Then $x_8$'s token embedding is added to the pipeline for the next round, while the target LLM verifies the oldest token in the pipeline ($x_6$) based on ground-truth output logits of the token $x_5$ that is just popped out of the pipeline.
@@ -25,7 +29,18 @@ speculative_pipeline_decoding/
 └── README.md
 ```
 
-Checkpoints store `config['version'] == 11` and are compatible with weights trained by this release’s `train.py`. v10 checkpoints are supported via `old_version_v10/`.
+## v11 vs. v10 (key differences)
+
+| Topic | v10 (paper / `old_version_v10/`) | v11 (`main` / top-level scripts) |
+|-------|----------------------------------|----------------------------------|
+| Aggregation config | `shallow_hidden_layer_indices`: `n` semicolon-separated groups for `g_n … g_1` (per pipeline-stage depth) | `aggr_feature_bound`: `m` HF hidden-state anchor indices for `g_0 … g_{m-1}` |
+| Training layout | `(n+1)·S` tokens: `[g_n, g_{n-1}, …, g_1, g_0]` | `m·S` tokens: `[g_{m-1}, …, g_0]` (`num_aggr_types` = `m`) |
+| Attention roles | Only `g_0` rows act as **query**; other rows are key/value | **All** `m` aggregation rows are query, key, and value |
+| `g_0` source | Token embedding only, via a dedicated `g0_proj` FC | One of `m` aggregation types; each `g_k` is an FC over selected hidden states (embedding for `g_0`) |
+| Output head | `lm_head` on `g_0` query output (same idea) | `lm_head` on the `g_0` block output only |
+| Inference schedule | Speculation runs in parallel with one pipeline step; features from pipeline **input** depths | Same parallel schedule; row `g_k` at pipeline depth `d` uses anchor `g_{f(d), d}` from `aggr_feature_bound` |
+
+Checkpoints store `config['version'] == 11` and are compatible with weights trained by this release's `train.py`. v10 checkpoints (`config['version'] == 10`) are **not** interchangeable with v11 weights — load them via `old_version_v10/` or the [`v10`](https://huggingface.co/yuyijiong/speculative_pipeline_decoding/tree/v10) branch on Hugging Face.
 
 ## Requirements
 
