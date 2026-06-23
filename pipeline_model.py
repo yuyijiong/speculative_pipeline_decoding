@@ -675,6 +675,56 @@ class SpeculationTransformerModuleV11(nn.Module):
         return self.forward_inference_with_rotary(*args, **kwargs)
 
 
+def stage_layers_from_spec_cfg(spec_cfg: dict[str, Any]) -> Optional[List[int]]:
+    """Parse optional per-stage layer counts from a speculation-head checkpoint config."""
+    raw = spec_cfg.get("stage_layers")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        if not parts:
+            return None
+        return [int(p) for p in parts]
+    if isinstance(raw, (list, tuple)):
+        return [int(x) for x in raw]
+    raise ValueError(f"stage_layers must be a semicolon-separated string or list, got {type(raw)!r}")
+
+
+def resolve_stage_layer_ranges(
+    stage_layers: Optional[Sequence[int]],
+    *,
+    num_stages: int,
+    num_layers: int,
+) -> List[Tuple[int, int]]:
+    """Convert per-stage layer counts (or ``None`` for uniform split) to ``[(lo, hi), ...]``."""
+    n_stages = int(num_stages)
+    n_layers = int(num_layers)
+    if stage_layers is None:
+        if n_layers % n_stages != 0:
+            raise ValueError(
+                f"num_layers ({n_layers}) must be divisible by num_stages ({n_stages}) "
+                "when stage_layers is not set"
+            )
+        lps = n_layers // n_stages
+        return [(s * lps, (s + 1) * lps) for s in range(n_stages)]
+    counts = [int(x) for x in stage_layers]
+    if len(counts) != n_stages:
+        raise ValueError(
+            f"stage_layers length {len(counts)} must equal num_stages ({n_stages})"
+        )
+    if sum(counts) != n_layers:
+        raise ValueError(
+            f"stage_layers sum {sum(counts)} must equal num_layers ({n_layers})"
+        )
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for count in counts:
+        end = start + count
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
 def default_aggr_feature_bound(num_layers: int, num_stages: int) -> List[int]:
     """Default ``aggr_feature_bound`` for ``num_layers`` and ``num_stages`` (see ``结构v11.md``)."""
     n = int(num_stages)
@@ -698,6 +748,7 @@ class Qwen3PipelineModelV11(nn.Module):
         draft_token_ids: Optional[Sequence[int]] = None,
         aggr_feature_bound: Optional[Sequence[int]] = None,
         trained_with_use_deepest: bool = False,
+        stage_layers: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.base_model = base_model
@@ -714,11 +765,16 @@ class Qwen3PipelineModelV11(nn.Module):
         )
 
         self.num_layers = num_hidden_layers_from_hf_config(self.config)
-        if self.num_layers % self.num_stages != 0:
-            raise ValueError(
-                f"num_layers ({self.num_layers}) must be divisible by num_stages ({self.num_stages})"
-            )
-        self.layers_per_stage = self.num_layers // self.num_stages
+        self.stage_layer_ranges = resolve_stage_layer_ranges(
+            list(stage_layers) if stage_layers is not None else None,
+            num_stages=self.num_stages,
+            num_layers=self.num_layers,
+        )
+        stage_sizes = [hi - lo for lo, hi in self.stage_layer_ranges]
+        if len(set(stage_sizes)) == 1:
+            self.layers_per_stage = stage_sizes[0]
+        else:
+            self.layers_per_stage = max(stage_sizes)
         dec_cfg = _decoder_relevant_config(self.config)
         self.hidden_size = int(dec_cfg.hidden_size)
         self.vocab_size = int(dec_cfg.vocab_size)

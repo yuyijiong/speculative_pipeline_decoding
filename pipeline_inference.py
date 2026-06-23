@@ -172,7 +172,7 @@ def _pipeline_init_kwargs(cfg: dict[str, Any], *, version: int) -> dict[str, Any
         raw_bound = cfg.get("aggr_feature_bound")
         if raw_bound is not None:
             kw["aggr_feature_bound"] = [int(x) for x in raw_bound]
-        from modeling_qwen3_pipeline_v11 import stage_layers_from_spec_cfg
+        from pipeline_model import stage_layers_from_spec_cfg
 
         stage_layers = stage_layers_from_spec_cfg(cfg)
         if stage_layers is not None:

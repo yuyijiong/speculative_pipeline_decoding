@@ -4,11 +4,9 @@ Original implementation of [**Speculative Pipeline Decoding: Higher-Accruacy and
 
 > **Important**
 >
-> This repository is intended to **demonstrate algorithmic correctness** only. It has **not** been tuned for production performance: there is no system-level optimization, no integration with dedicated inference engines (e.g. vLLM, sglang), and the reference implementation still contains many **sequential** steps on the Python side. As a result, **wall-clock latency can be higher than standard autoregressive decoding** in this codebase, even when acceptance rates look favorable. Reported speedup metrics in `eval.py` is theoretical; treat measured end-to-end time here as a correctness baseline, not a deployment benchmark.
-
-> **Paper vs. code**
+> The **single-process** scripts (`pipeline_inference.py`, `eval.py`) are intended to **demonstrate algorithmic correctness** and report theoretical speedup from per-stage GPU timers. They are not tuned for production and can be **slower than standard autoregressive decoding** on one GPU because of Python-side sequential overhead.
 >
-> The [arXiv paper](https://arxiv.org/abs/2605.30852) was written against the **v10** speculation-head design (`shallow_hidden_layer_indices`, `(n+1)·S` training layout, `g_0`-only query). This repository's **`main` branch is v11** (`pipeline_model.py`, `train.py`, etc.). The method overview below and the paper figure describe the same high-level pipeline schedule (target pipeline step and speculation in parallel, verify / rollback); differences are in how aggregated features `g_k` are defined, configured, and fed into the speculation module. To reproduce the paper's v10 setup, use `old_version_v10/`; for current checkpoints on [Hugging Face](https://huggingface.co/yuyijiong/speculative_pipeline_decoding), use the top-level v11 scripts.
+> For **real multi-GPU wall-clock benchmarks** (prefill/decode tok/s, acceptance on bundled datasets), use [`distributed_inference/`](distributed_inference/) with `torchrun` — see [Distributed inference](#distributed-inference-real-speed-benchmarks).
 
 ## Method overview
 ![Method](method.png)
@@ -18,13 +16,14 @@ The architecture of Speculative Pipeline Decoding when the number of stages is 3
 
 ```
 speculative_pipeline_decoding/
-├── pipeline_model.py       # Qwen3SpeculativePipelineModel (v11) + speculation head
-├── old_version_v10/        # Archived v10 implementation (training / inference / eval)
-├── train.py                # Train the speculation head (v11)
-├── pipeline_inference.py   # Load checkpoint, run pipeline / HF generate
-├── eval.py                 # Benchmark on bundled eval sets
-├── eval_data/              # MT-Bench, HumanEval, GSM8K prompts (EAGLE jsonl format)
-├── draft_vocab/            # Pre-built draft vocabularies (token id subsets)
+├── pipeline_model.py           # Qwen3SpeculativePipelineModel + speculation head
+├── train.py                    # Train the speculation head
+├── pipeline_inference.py       # Load checkpoint, run pipeline / HF generate (single GPU)
+├── eval.py                     # Benchmark on bundled eval sets (theoretical speedup)
+├── distributed_inference/      # Multi-GPU torch.distributed inference (real wall-clock)
+├── old_version_v10/            # Archived earlier implementation
+├── eval_data/                  # MT-Bench, HumanEval, GSM8K prompts (EAGLE jsonl format)
+├── draft_vocab/                # Pre-built draft vocabularies (token id subsets)
 ├── requirements.txt
 └── README.md
 ```
@@ -141,6 +140,33 @@ Results:
 - `eval_output/summary/pipeline_eval__*__summary.json` — aggregates (acceptance rate, theoretical speedup)
 
 Multi-GPU: `--gpus 0,1,2,3`. Optional baseline cache: `--baseline --baseline_cache_dir ./eval_output/baseline`.
+
+## Distributed inference (real speed benchmarks)
+
+Multi-GPU pipeline-parallel decoding via `torch.distributed` lives under [`distributed_inference/`](distributed_inference/). It shards the target model across ranks, overlaps stage forwards with speculation, and reports **wall-clock** prefill/decode time — use this path to measure end-to-end throughput, not the theoretical metrics from `eval.py`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --standalone --nproc_per_node=5 \
+  distributed_inference/run_generate.py \
+  --spec_head_ckpt /path/to/speculation_head_final.pt \
+  --base_model_path Qwen/Qwen3.5-4B \
+  --rank_gpus 0,1,2,3,4 \
+  --max_new_tokens 512 \
+  --temperature 0.0
+```
+
+`--nproc_per_node` must equal `num_stages + 1` from the checkpoint (or `num_stages` with `--merge_last_stage`). Dataset eval with the same prompts as `eval.py`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --standalone --nproc_per_node=5 \
+  distributed_inference/eval_benchmark.py \
+  --spec_head_ckpt /path/to/speculation_head_final.pt \
+  --data_dir eval_data \
+  --output_dir ./eval_output_distributed \
+  --rank_gpus 0,1,2,3,4
+```
+
+See [`distributed_inference/README.md`](distributed_inference/README.md) for rank layout, uneven `stage_layers` checkpoints, and timing breakdown fields.
 
 ## Citation
 

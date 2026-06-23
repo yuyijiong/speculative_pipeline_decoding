@@ -6,4 +6,5 @@ wandb/
 dataset_cache/
 training_output/
 eval_output/
+eval_output_distributed/
 *.log
