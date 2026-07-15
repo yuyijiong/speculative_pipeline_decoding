@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict
 
 import torch
 
-from . import _paths  # noqa: F401
-from pipeline_linear_cache import make_pipeline_dynamic_cache
-
 from .cache import split_unified_cache_into_shards
-from .cache_meta import cache_layer_types_from_config
 from .dist_io import dist_broadcast
 from .dist_log import dist_log
 from .device import PhaseTimeout, sync_device
 from .kv_transfer import recv_cache_shard, send_cache_shard
 from .loader import PrefillRank0Bundle, StageRankBundle
-from .pipeline_model import _sampling_probs_hf_style
 from .topology import rank_for_stage
+
+_SPEC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SPEC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SPEC_ROOT))
+
+from pipeline_linear_cache import make_pipeline_dynamic_cache  # noqa: E402
+
+from .cache_meta import cache_layer_types_from_config  # noqa: E402
+from .pipeline_model import _sampling_probs_hf_style  # noqa: E402
 
 
 @dataclass
@@ -53,7 +59,6 @@ def run_prefill(
     temperature: float,
     top_k: int,
     top_p: float,
-    merge_last_stage: bool = False,
 ) -> PrefillResult | None:
     timeout.check()
     num_stages = (
@@ -100,13 +105,7 @@ def run_prefill(
         )
         for stage_idx in range(n):
             timeout.check()
-            dest = rank_for_stage(stage_idx, n, merge_last_stage=merge_last_stage)
-            if dest == 0:
-                assert worker_bundle is not None
-                assert int(worker_bundle.stage_idx) == n - 1
-                worker_bundle.kv_shard.layers = sharded.shards[stage_idx].layers
-                dist_log(f"prefill: rank0 assigned local KV shard for stage {stage_idx}")
-                continue
+            dest = rank_for_stage(stage_idx, n)
             dist_log(f"prefill: rank0 sending KV shard to rank {dest} (stage {stage_idx})")
             send_cache_shard(
                 sharded.shards[stage_idx],

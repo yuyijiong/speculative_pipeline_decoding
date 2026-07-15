@@ -1,9 +1,11 @@
-"""Load per-rank model shards for multi-process pipeline decoding."""
+"""Load per-rank model shards for multi-process pipeline decoding (v11)."""
 
 from __future__ import annotations
 
 import copy
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -15,7 +17,12 @@ from .cache import StageCacheView, make_stage_sharded_caches
 from .topology import stage_idx_for_rank
 from .cache_meta import cache_layer_types_from_config
 from .device import cast_module, module_compute_dtype
-from .pipeline_model import (
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from modeling_qwen3_pipeline_v11 import (  # noqa: E402
     Qwen3PipelineModelV11,
     _decoder_relevant_config,
     _linear_and_hybrid_attention_layer_indices_for_cache,
@@ -128,6 +135,53 @@ def v11_init_from_spec_cfg(spec_cfg: dict[str, Any]) -> dict[str, Any]:
     return kw
 
 
+def format_ckpt_key_info_lines(
+    spec_cfg: dict[str, Any],
+    *,
+    base_model_path: str,
+    spec_ckpt_path: str = "",
+) -> List[str]:
+    """Human-readable checkpoint summary for example/eval logs."""
+    raw_bound = spec_cfg.get("aggr_feature_bound")
+    if raw_bound is None:
+        aggr_str = "default"
+    elif isinstance(raw_bound, str):
+        aggr_str = raw_bound.strip()
+    else:
+        aggr_str = ",".join(str(int(x)) for x in raw_bound)
+
+    raw_sl = spec_cfg.get("stage_layers")
+    if isinstance(raw_sl, str) and raw_sl.strip():
+        stage_layers_str = raw_sl.strip()
+    elif isinstance(raw_sl, list) and raw_sl:
+        if all(isinstance(row, list) for row in raw_sl):
+            if all(len(row) == 1 for row in raw_sl):
+                stage_layers_str = ";".join(str(int(row[0])) for row in raw_sl)
+            else:
+                stage_layers_str = ";".join(str(len(row)) for row in raw_sl)
+        else:
+            stage_layers_str = str(raw_sl)
+    else:
+        raw_ranges = spec_cfg.get("stage_layer_ranges")
+        if raw_ranges:
+            stage_layers_str = ";".join(
+                str(int(r[1]) - int(r[0])) for r in raw_ranges
+            )
+        else:
+            stage_layers_str = "uniform"
+
+    lines = [
+        f"base_model: {base_model_path}",
+        f"num_stages: {int(spec_cfg['num_stages'])}",
+        f"num_spec_layers: {int(spec_cfg.get('num_spec_layers', 1))}",
+        f"aggr_feature_bound: {aggr_str}",
+        f"stage_layers: {stage_layers_str}",
+    ]
+    if spec_ckpt_path:
+        lines.insert(0, f"spec_head_ckpt: {spec_ckpt_path}")
+    return lines
+
+
 def load_spec_checkpoint_config(spec_ckpt_path: str) -> dict[str, Any]:
     try:
         ckpt = torch.load(spec_ckpt_path, map_location="cpu", weights_only=False)
@@ -222,16 +276,13 @@ def load_stage_rank_bundle(
     dtype: torch.dtype,
     device: torch.device,
     attn_implementation: str = "flash_attention_2",
-    merge_last_stage: bool = False,
 ) -> StageRankBundle:
     spec_cfg = load_spec_checkpoint_config(spec_ckpt_path)
     num_stages = int(spec_cfg["num_stages"])
-    stage_idx = stage_idx_for_rank(
-        rank, num_stages, merge_last_stage=merge_last_stage
-    )
+    stage_idx = stage_idx_for_rank(rank, num_stages)
     if stage_idx is None:
         raise ValueError(f"load_stage_rank_bundle expects a stage rank, got rank={rank}")
-    if not merge_last_stage and rank < 1:
+    if rank < 1:
         raise ValueError(f"load_stage_rank_bundle expects rank>=1, got {rank}")
 
     base = AutoModelForCausalLM.from_pretrained(

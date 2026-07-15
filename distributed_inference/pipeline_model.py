@@ -1,11 +1,15 @@
-"""Re-export single-process pipeline helpers used by distributed rank 0."""
+"""Re-export v11 single-process pipeline model helpers for multi-process rank0."""
 
 from __future__ import annotations
 
-from ._paths import REPO_ROOT  # noqa: F401
+import sys
+from pathlib import Path
 
-from pipeline_model import (  # noqa: E402,F401
-    Qwen3PipelineModelV11,
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from modeling_qwen3_pipeline_v11 import (  # noqa: E402,F401
     Qwen3PipelineModelV11 as Qwen3SpeculativePipelineModel,
     SpeculationTransformerModuleV11 as SpeculationHeadTransformer,
     _decoder_relevant_config,
@@ -14,6 +18,4 @@ from pipeline_model import (  # noqa: E402,F401
     _verify_pipeline_draft_token,
     default_aggr_feature_bound,
     num_hidden_layers_from_hf_config,
-    resolve_stage_layer_ranges,
-    stage_layers_from_spec_cfg,
 )

@@ -21,6 +21,9 @@ class _GlooRecvWork:
         self._cpu_buf = cpu_buf
         self._dst = dst
 
+    def is_completed(self) -> bool:
+        return bool(self._work.is_completed())
+
     def wait(self) -> bool:
         self._work.wait()
         self._dst.copy_(self._cpu_buf)

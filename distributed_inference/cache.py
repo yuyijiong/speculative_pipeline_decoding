@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import copy
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
 
-from . import _paths  # noqa: F401
+_SPEC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SPEC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SPEC_ROOT))
+
 from pipeline_linear_cache import (  # noqa: E402
     PipelineLinearAttentionAndFullAttentionLayer,
     PipelineLinearAttentionLayer,

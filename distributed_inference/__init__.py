@@ -1,4 +1,4 @@
-"""Multi-process pipeline parallel speculative decoding (torch.distributed + NCCL)."""
+"""Multi-process pipeline parallel speculative decoding v11 (torch.distributed + NCCL)."""
 
 from .loader import Rank0Bundle, StageRankBundle, load_rank0_decode_bundle, load_stage_rank_bundle
 from .rank0_controller import Rank0Controller
