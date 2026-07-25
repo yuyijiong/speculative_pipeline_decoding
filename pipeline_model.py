@@ -249,10 +249,131 @@ def _linear_and_hybrid_attention_layer_indices_for_cache(dec_cfg: Any) -> List[i
     return [i for i, t in enumerate(lt) if t in ("linear_attention", "hybrid")]
 
 
-def _speculation_attn_config(config) -> Any:
-    """Deep copy base decoder config; inference keeps the same attn as the target LLM."""
+def _get_text_decoder_backbone(base_model: PreTrainedModel) -> nn.Module:
+    """Text decoder stack from ``AutoModelForCausalLM`` (``base_model.model``)."""
+    return base_model.model
+
+
+def load_base_model_for_pipeline(
+    model_name: str,
+    *,
+    dtype: torch.dtype | str | None = None,
+    device_map: Any = None,
+    attn_implementation: str | None = None,
+    trust_remote_code: bool = True,
+    use_bnb_quant: bool = False,
+) -> PreTrainedModel:
+    """Load the text-only causal LM; vision weights in a VLM repo are ignored by HF."""
+    from transformers import AutoModelForCausalLM
+
+    kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    if attn_implementation is not None:
+        kwargs["attn_implementation"] = attn_implementation
+    if use_bnb_quant:
+        from transformers import BitsAndBytesConfig
+
+        compute_dtype = torch.bfloat16
+        if isinstance(dtype, torch.dtype):
+            compute_dtype = dtype
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    elif dtype is not None:
+        kwargs["dtype"] = dtype
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    except TypeError:
+        legacy = dict(kwargs)
+        if "dtype" in legacy:
+            legacy["torch_dtype"] = legacy.pop("dtype")
+        return AutoModelForCausalLM.from_pretrained(model_name, **legacy)
+
+
+def _uses_hf_qwen35_spec_decoder_layer(config: Any) -> bool:
+    dec = _decoder_relevant_config(config)
+    mt = getattr(dec, "model_type", None)
+    return mt in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+
+
+def _get_spec_base_decoder_layer_class(config: Any) -> type:
+    """HF decoder layer class for speculation towers (dense / MoE / hybrid Qwen3.5)."""
+    dec = _decoder_relevant_config(config)
+    mt = getattr(dec, "model_type", None)
+    if mt is None:
+        raise ValueError("config has no model_type; cannot build speculation layers.")
+
+    if mt == "llama":
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+        return LlamaDecoderLayer
+    if mt == "qwen2":
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+
+        return Qwen2DecoderLayer
+    if mt == "qwen3":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        return Qwen3DecoderLayer
+    if mt == "qwen3_moe":
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
+
+        return Qwen3MoeDecoderLayer
+    if mt in ("qwen3_5", "qwen3_5_text"):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        return Qwen3_5DecoderLayer
+    if mt in ("qwen3_5_moe", "qwen3_5_moe_text"):
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+
+        return Qwen3_5MoeDecoderLayer
+
+    raise ValueError(
+        f"Unsupported decoder model_type={mt!r} for pipeline v11 speculation layers. "
+        "Extend _get_spec_base_decoder_layer_class() for new architectures."
+    )
+
+
+def _speculation_attn_config(
+    config: Any,
+    *,
+    num_spec_layers: int = 1,
+    spec_intermediate_size_fallback: int = 9216,
+) -> Any:
+    """Deep copy decoder config; spec layers always use dense full attention (never MoE)."""
     c = copy.deepcopy(config)
+    lt = getattr(c, "layer_types", None)
+    if lt is not None:
+        lt = list(lt)
+        n_spec = max(1, int(num_spec_layers))
+        while len(lt) < n_spec:
+            lt.append("full_attention")
+        for i in range(n_spec):
+            lt[i] = "full_attention"
+        c.layer_types = lt
+    if getattr(c, "intermediate_size", None) is None:
+        c.intermediate_size = int(spec_intermediate_size_fallback)
     return c
+
+
+def _get_dense_spec_decoder_layer_class(config: Any) -> type:
+    """Dense decoder layer for the speculation tower (base may be MoE; spec tower is not)."""
+    dec = _decoder_relevant_config(config)
+    mt = getattr(dec, "model_type", None)
+    if mt in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        return Qwen3_5DecoderLayer
+    if mt == "qwen3_moe":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        return Qwen3DecoderLayer
+    return _get_spec_base_decoder_layer_class(config)
 
 
 @contextmanager
@@ -273,7 +394,8 @@ def _force_sdpa_attn_context(config):
 
 
 def _get_apply_rotary_pos_emb(config):
-    mt = getattr(config, "model_type", None)
+    dec = _decoder_relevant_config(config)
+    mt = getattr(dec, "model_type", None) or getattr(config, "model_type", None)
     if mt in ("qwen3", "qwen3_moe"):
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
@@ -383,8 +505,31 @@ class PipelineDecoderLayer(nn.Module):
         return hidden_states
 
 
+def _make_spec_decoder_layer(
+    config: Any,
+    *,
+    layer_idx: int,
+    apply_rotary_fn: Callable[..., Tuple[torch.Tensor, torch.Tensor]],
+) -> nn.Module:
+    """
+    Speculation decoder layers are always dense (even when the frozen base is MoE).
+    Qwen3.5-class models use native HF dense decoder layers (gated attn, dense MLP).
+    Qwen3-class dense models keep the custom ``PipelineDecoderLayer`` RoPE path.
+    """
+    dec = _decoder_relevant_config(config)
+    mt = getattr(dec, "model_type", None)
+    if mt in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_moe"):
+        layer_cls = _get_dense_spec_decoder_layer_class(config)
+        return layer_cls(config, layer_idx=int(layer_idx))
+    return PipelineDecoderLayer(config, layer_idx=int(layer_idx), apply_rotary_fn=apply_rotary_fn)
+
+
 def _force_spec_layer_full_attention(layer: nn.Module) -> None:
-    layer.self_attn.layer_type = "full_attention"
+    if hasattr(layer, "layer_type"):
+        layer.layer_type = "full_attention"
+    sa = getattr(layer, "self_attn", None)
+    if sa is not None and hasattr(sa, "layer_type"):
+        sa.layer_type = "full_attention"
 
 
 def _copy_matching_decoder_layer_weights_from_base(
@@ -422,8 +567,7 @@ def _copy_matching_decoder_layer_weights_from_base(
             stacklevel=2,
         )
 
-def _build_pipeline_training_mask_v11(
-    attention_mask_ms: torch.Tensor,
+def _build_pipeline_training_structural_mask_v11(
     *,
     n: int,
     m: int,
@@ -432,24 +576,11 @@ def _build_pipeline_training_mask_v11(
     stage_depth_to_aggr_idx: Sequence[int],
     mask_dtype: torch.dtype,
     simulated_pipeline_fill: int,
+    device: torch.device,
 ) -> torch.Tensor:
-    """
-    ``[B, m*S]`` padding mask -> ``[B, 1, m*S, m*S]`` additive mask.
-
-    Layout (stage-major): blocks ``b=0..m-1`` are ``g_{m-1}, ..., g_0``; each block has time ``0..S-1``.
-    Query at block ``bq``, position ``t`` uses representative depth ``d_q = aggr_to_min_depth[m-1-bq]``.
-    Key at block ``bk``, position ``T`` is visible iff ``T<=t`` and the required key block index
-    ``stage_depth_to_aggr_idx[d']`` equals ``m-1-bk``, where ``d' = min(n, d_q + t - T)``.
-
-    When ``simulated_pipeline_fill < n`` (partial pipeline), keys at distance ``t-T >= fill`` must
-  attend the deepest block ``g_m`` (aggr index ``m-1``) instead of ``g(d')`` — unlike v10 we only
-    change the mask (v11 may map multiple depths to one block).
-    """
-    b, lseq = attention_mask_ms.shape
+    """Batch-independent structural mask ``[1, 1, m*S, m*S]`` (reusable across steps)."""
     m_i = int(m)
-    if lseq != m_i * s:
-        raise ValueError(f"expected length m*S={m_i * s}, got {lseq}")
-    device = attention_mask_ms.device
+    lseq = m_i * s
     neg = torch.finfo(mask_dtype).min
 
     pos_list: List[int] = []
@@ -482,11 +613,55 @@ def _build_pipeline_training_mask_v11(
         deepest_aggr = torch.tensor(m_i - 1, device=device, dtype=torch.long)
         k_aggr_required = torch.where(delta >= fill_t, deepest_aggr, k_aggr_required)
     structural = (pk <= pq) & (aggr_k == k_aggr_required)
+    return torch.where(structural, torch.zeros((), device=device, dtype=mask_dtype), neg)
 
+
+def _build_pipeline_training_mask_v11(
+    attention_mask_ms: torch.Tensor,
+    *,
+    n: int,
+    m: int,
+    s: int,
+    aggr_to_min_depth: Sequence[int],
+    stage_depth_to_aggr_idx: Sequence[int],
+    mask_dtype: torch.dtype,
+    simulated_pipeline_fill: int,
+    structural_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    ``[B, m*S]`` padding mask -> ``[B, 1, m*S, m*S]`` additive mask.
+
+    Layout (stage-major): blocks ``b=0..m-1`` are ``g_{m-1}, ..., g_0``; each block has time ``0..S-1``.
+    Query at block ``bq``, position ``t`` uses representative depth ``d_q = aggr_to_min_depth[m-1-bq]``.
+    Key at block ``bk``, position ``T`` is visible iff ``T<=t`` and the required key block index
+    ``stage_depth_to_aggr_idx[d']`` equals ``m-1-bk``, where ``d' = min(n, d_q + t - T)``.
+
+    When ``simulated_pipeline_fill < n`` (partial pipeline), keys at distance ``t-T >= fill`` must
+  attend the deepest block ``g_m`` (aggr index ``m-1``) instead of ``g(d')`` — unlike v10 we only
+    change the mask (v11 may map multiple depths to one block).
+    """
+    b, lseq = attention_mask_ms.shape
+    m_i = int(m)
+    if lseq != m_i * s:
+        raise ValueError(f"expected length m*S={m_i * s}, got {lseq}")
+    device = attention_mask_ms.device
+    if structural_mask is None:
+        structural_mask = _build_pipeline_training_structural_mask_v11(
+            n=n,
+            m=m,
+            s=s,
+            aggr_to_min_depth=aggr_to_min_depth,
+            stage_depth_to_aggr_idx=stage_depth_to_aggr_idx,
+            mask_dtype=mask_dtype,
+            simulated_pipeline_fill=simulated_pipeline_fill,
+            device=device,
+        )
     v = attention_mask_ms.to(dtype=torch.bool)
     q_valid = v.view(b, 1, lseq, 1)
     k_valid = v.view(b, 1, 1, lseq)
-    return torch.where(structural & q_valid & k_valid, torch.zeros((), device=device, dtype=mask_dtype), neg)
+    valid = q_valid & k_valid
+    neg_t = torch.tensor(torch.finfo(mask_dtype).min, device=device, dtype=mask_dtype)
+    return torch.where(valid, structural_mask, neg_t)
 
 
 class SpeculationTransformerModuleV11(nn.Module):
@@ -512,7 +687,7 @@ class SpeculationTransformerModuleV11(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self._decoder_layer_cls = decoder_layer_cls or PipelineDecoderLayer
+        self._decoder_layer_cls = decoder_layer_cls
         self.num_spec_layers = int(num_spec_layers)
         self.num_aggr_types = int(num_aggr_types)
         if self.num_spec_layers < 1:
@@ -553,9 +728,10 @@ class SpeculationTransformerModuleV11(nn.Module):
         self.lm_head = nn.Linear(h, self.draft_vocab_size, bias=False, device=device, dtype=dtype)
         self.rotary_emb = _clone_rotary_embedding_from_base(base_rotary_emb, device=device)
         self._apply_rotary_fn = apply_rotary_fn
+        make_layer = self._decoder_layer_cls or _make_spec_decoder_layer
         self.spec_layers = nn.ModuleList(
             [
-                self._decoder_layer_cls(config, layer_idx=i, apply_rotary_fn=self._apply_rotary_fn)
+                make_layer(config, layer_idx=i, apply_rotary_fn=self._apply_rotary_fn)
                 for i in range(self.num_spec_layers)
             ]
         )
@@ -749,6 +925,7 @@ class Qwen3PipelineModelV11(nn.Module):
         aggr_feature_bound: Optional[Sequence[int]] = None,
         trained_with_use_deepest: bool = False,
         stage_layers: Optional[Sequence[int]] = None,
+        spec_intermediate_size_fallback: int = 9216,
     ):
         super().__init__()
         self.base_model = base_model
@@ -760,6 +937,7 @@ class Qwen3PipelineModelV11(nn.Module):
         self.num_stages = int(num_stages)
         self.num_spec_layers = int(num_spec_layers)
         self.trained_with_use_deepest = bool(trained_with_use_deepest)
+        self.spec_intermediate_size_fallback = int(spec_intermediate_size_fallback)
         self.spec_init_from_base_layers: Optional[List[int]] = (
             list(spec_init_from_base_layers) if spec_init_from_base_layers is not None else None
         )
@@ -778,7 +956,7 @@ class Qwen3PipelineModelV11(nn.Module):
         dec_cfg = _decoder_relevant_config(self.config)
         self.hidden_size = int(dec_cfg.hidden_size)
         self.vocab_size = int(dec_cfg.vocab_size)
-        self.dtype = self.base_model.dtype
+        self.dtype = torch.bfloat16
         self.device = self.base_model.device
 
         if self.spec_init_from_base_layers is not None:
@@ -820,18 +998,25 @@ class Qwen3PipelineModelV11(nn.Module):
                 to_draft[tid] = i
             self.register_buffer("_token_id_to_draft_idx", to_draft, persistent=True)
 
-        spec_cfg = _speculation_attn_config(dec_cfg)
+        self._decoder_backbone = _get_text_decoder_backbone(self.base_model)
+        spec_cfg = _speculation_attn_config(
+            dec_cfg,
+            num_spec_layers=self.num_spec_layers,
+            spec_intermediate_size_fallback=self.spec_intermediate_size_fallback,
+        )
         self.speculation_module = SpeculationTransformerModuleV11(
             spec_cfg,
             self.dtype,
             self.device,
-            base_rotary_emb=self.base_model.model.rotary_emb,
+            base_rotary_emb=self._decoder_backbone.rotary_emb,
             apply_rotary_fn=_get_apply_rotary_pos_emb(self.config),
             aggr_feature_indices=self.aggr_feature_indices,
             num_aggr_types=self.num_aggr_types,
             num_spec_layers=self.num_spec_layers,
             init_weights_from_base_layer_indices=self.spec_init_from_base_layers,
-            base_decoder_layers=self.base_model.model.layers if self.spec_init_from_base_layers is not None else None,
+            base_decoder_layers=(
+                self._decoder_backbone.layers if self.spec_init_from_base_layers is not None else None
+            ),
             draft_vocab_size=self.draft_vocab_size,
         )
 
@@ -849,18 +1034,86 @@ class Qwen3PipelineModelV11(nn.Module):
         self._stage_streams: List[Optional[torch.cuda.Stream]] = [
             torch.cuda.Stream() if torch.cuda.is_available() else None for _ in range(self.num_stages)
         ]
+        self._training_structural_mask_cache: Dict[Tuple[Any, ...], torch.Tensor] = {}
+
+    def _needed_teacher_hs_indices(self) -> Tuple[int, ...]:
+        return tuple(sorted({int(i) for row in self.aggr_feature_indices for i in row}))
+
+    def _forward_base_for_training(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        """Run frozen base once; capture only aggregation anchor hidden states (not all layers)."""
+        needed = self._needed_teacher_hs_indices()
+        captured: Dict[int, torch.Tensor] = {}
+        handles: List[Any] = []
+        layers = self._decoder_backbone.layers
+
+        def _make_hook(hs_idx: int):
+            def hook(_module, _inp, output):
+                hs = output[0] if isinstance(output, tuple) else output
+                captured[hs_idx] = hs
+
+            return hook
+
+        for hs_idx in needed:
+            if hs_idx <= 0:
+                continue
+            layer_i = hs_idx - 1
+            if layer_i < 0 or layer_i >= len(layers):
+                raise ValueError(
+                    f"Teacher hidden-state index {hs_idx} out of range for {len(layers)} decoder layers"
+                )
+            handles.append(layers[layer_i].register_forward_hook(_make_hook(hs_idx)))
+
+        try:
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        if 0 in needed:
+            captured[0] = self.embed_tokens(input_ids)
+        missing = [idx for idx in needed if idx not in captured]
+        if missing:
+            raise RuntimeError(f"Failed to capture teacher hidden states for indices: {missing}")
+        return outputs.logits, captured
+
+    def _get_training_structural_mask(self, *, s: int, fill: int, device: torch.device) -> torch.Tensor:
+        key = (self.num_stages, self.num_aggr_types, int(s), int(fill), str(self.dtype), str(device))
+        cached = self._training_structural_mask_cache.get(key)
+        if cached is not None and cached.device == device:
+            return cached
+        mask = _build_pipeline_training_structural_mask_v11(
+            n=self.num_stages,
+            m=self.num_aggr_types,
+            s=int(s),
+            aggr_to_min_depth=self.aggr_to_min_depth,
+            stage_depth_to_aggr_idx=self.stage_depth_to_aggr_idx,
+            mask_dtype=self.dtype,
+            simulated_pipeline_fill=int(fill),
+            device=device,
+        )
+        self._training_structural_mask_cache[key] = mask
+        return mask
 
     @property
     def layers(self) -> nn.ModuleList:
-        return self.base_model.model.layers
+        return self._decoder_backbone.layers
 
     @property
     def embed_tokens(self) -> nn.Embedding:
-        return self.base_model.model.embed_tokens
+        return self._decoder_backbone.embed_tokens
 
     @property
     def final_norm(self) -> nn.Module:
-        return self.base_model.model.norm
+        return self._decoder_backbone.norm
 
     @property
     def lm_head(self) -> nn.Linear:
@@ -869,7 +1122,7 @@ class Qwen3PipelineModelV11(nn.Module):
     @property
     def rotary_emb(self) -> nn.Module:
         """RoPE module for the frozen base transformer (not used by the speculation tower)."""
-        return self.base_model.model.rotary_emb
+        return self._decoder_backbone.rotary_emb
 
     @property
     def speculation_head(self) -> SpeculationTransformerModuleV11:
@@ -937,11 +1190,11 @@ class Qwen3PipelineModelV11(nn.Module):
 
     def _fuse_from_hf_indices(
         self,
-        all_hs: Tuple[torch.Tensor, ...],
+        hs_by_idx: Dict[int, torch.Tensor],
         hf_indices: Sequence[int],
         proj: nn.Linear,
     ) -> torch.Tensor:
-        vecs = [all_hs[int(idx)] for idx in hf_indices]
+        vecs = [hs_by_idx[int(idx)].to(torch.bfloat16) for idx in hf_indices]
         return proj(torch.cat(vecs, dim=-1))
 
     def _normalize_simulated_pipeline_fill(self, simulated_pipeline_fill: Optional[int]) -> int:
@@ -955,7 +1208,7 @@ class Qwen3PipelineModelV11(nn.Module):
 
     def _build_training_expanded_inputs(
         self,
-        all_hs: Tuple[torch.Tensor, ...],
+        hs_by_idx: Dict[int, torch.Tensor],
         simulated_pipeline_fill: Optional[int] = None,
     ) -> torch.Tensor:
         """
@@ -970,7 +1223,7 @@ class Qwen3PipelineModelV11(nn.Module):
         for aggr_i in range(m - 1, -1, -1):
             rows.append(
                 self._fuse_from_hf_indices(
-                    all_hs,
+                    hs_by_idx,
                     self.aggr_feature_indices[aggr_i],
                     self.speculation_module.aggr_projs[aggr_i],
                 )
@@ -1062,16 +1315,9 @@ class Qwen3PipelineModelV11(nn.Module):
             raise ValueError("labels and input_ids must have the same sequence length")
 
         with torch.no_grad():
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            teacher_logits = outputs.logits
-            all_hs = outputs.hidden_states
+            teacher_logits, hs_by_idx = self._forward_base_for_training(input_ids, attention_mask)
 
-        b, s, _ = all_hs[0].shape
+        b, s, _ = hs_by_idx[int(self.aggr_feature_indices[0][0])].shape
         n = self.num_stages
         m = self.num_aggr_types
         fill = self._normalize_simulated_pipeline_fill(simulated_pipeline_fill)
@@ -1081,11 +1327,12 @@ class Qwen3PipelineModelV11(nn.Module):
             attn2d = attention_mask.to(device=input_ids.device, dtype=torch.long)
 
         spec_hidden = self._build_training_expanded_inputs(
-            all_hs,
+            hs_by_idx,
             simulated_pipeline_fill=fill,
         )
         pos_ms = torch.arange(s, device=spec_hidden.device, dtype=torch.long).repeat(m).unsqueeze(0).expand(b, -1)
         attn_ms = attn2d.repeat(1, m)
+        structural_mask = self._get_training_structural_mask(s=s, fill=fill, device=spec_hidden.device)
         mask_4d = _build_pipeline_training_mask_v11(
             attn_ms,
             n=n,
@@ -1095,6 +1342,7 @@ class Qwen3PipelineModelV11(nn.Module):
             stage_depth_to_aggr_idx=self.stage_depth_to_aggr_idx,
             mask_dtype=self.dtype,
             simulated_pipeline_fill=fill,
+            structural_mask=structural_mask,
         )
 
         g0_processed = self.speculation_module.forward_training_with_rotary(
@@ -2141,6 +2389,7 @@ class Qwen3PipelineModelV11(nn.Module):
             "trained_with_use_deepest": bool(self.trained_with_use_deepest),
             "aggr_feature_bound": list(self.aggr_feature_bound),
             "base_model_path": self.base_model_path,
+            "spec_intermediate_size_fallback": int(self.spec_intermediate_size_fallback),
         }
         if self.spec_init_from_base_layers is not None:
             cfg["spec_init_from_base_layers"] = self.spec_init_from_base_layers

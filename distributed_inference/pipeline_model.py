@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from modeling_qwen3_pipeline_v11 import (  # noqa: E402,F401
-    Qwen3PipelineModelV11 as Qwen3SpeculativePipelineModel,
-    SpeculationTransformerModuleV11 as SpeculationHeadTransformer,
+from pipeline_model import (  # noqa: F401
+    Qwen3SpeculativePipelineModel,
+    SpeculationHeadTransformer,
     _decoder_relevant_config,
+    _get_text_decoder_backbone,
     _linear_and_hybrid_attention_layer_indices_for_cache,
     _sampling_probs_hf_style,
     _verify_pipeline_draft_token,
     default_aggr_feature_bound,
+    load_base_model_for_pipeline,
     num_hidden_layers_from_hf_config,
 )

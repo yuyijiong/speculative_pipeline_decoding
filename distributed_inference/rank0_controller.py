@@ -14,7 +14,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from modeling_qwen3_pipeline_v11 import (  # noqa: E402
+from pipeline_model import (  # noqa: E402
     _sampling_probs_hf_style,
     _verify_pipeline_draft_token,
 )

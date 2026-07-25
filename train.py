@@ -19,7 +19,6 @@ import torch.nn as nn
 from datasets import Dataset, concatenate_datasets, load_from_disk
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     Trainer,
@@ -30,6 +29,7 @@ from transformers.trainer_pt_utils import LengthGroupedSampler, get_length_group
 from pipeline_model import (
     Qwen3SpeculativePipelineModel,
     default_aggr_feature_bound,
+    load_base_model_for_pipeline,
     num_hidden_layers_from_hf_config,
 )
 
@@ -718,6 +718,9 @@ def save_speculation_head_checkpoint(
                         if getattr(pm, "_use_draft_vocab", False)
                         else {}
                     ),
+                    "spec_intermediate_size_fallback": int(
+                        getattr(pm, "spec_intermediate_size_fallback", 9216)
+                    ),
                 },
             },
             path,
@@ -764,6 +767,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--draft_vocab_json", type=str, default="")
     p.add_argument("--attn_implementation", type=str, default="flash_attention_2")
+    p.add_argument(
+        "--use_bnb_quant",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load the frozen base model in 4-bit via bitsandbytes (NF4) to reduce GPU memory.",
+    )
+    p.add_argument(
+        "--spec_intermediate_size_fallback",
+        type=int,
+        default=9216,
+        help=(
+            "Dense MLP intermediate_size for the speculation tower when the base config lacks "
+            "intermediate_size (e.g. Qwen3.5/3.6 MoE text_config only has moe_intermediate_size)."
+        ),
+    )
     p.add_argument("--chat_template_dir", type=str, default=".")
     p.add_argument("--encoded_dataset_cache_dir", type=str, default="./dataset_cache/pipeline_spd_encoded")
     p.add_argument("--force_rebuild_encoded_cache", action="store_true")
@@ -810,12 +828,14 @@ def main() -> None:
     apply_qwen3_file_chat_template(
         tokenizer, args.model_name, template_dir=args.chat_template_dir, model_type=model_type
     )
-    base_model = AutoModelForCausalLM.from_pretrained(
+    if args.use_bnb_quant:
+        log.info("Loading base model with bitsandbytes 4-bit quantization (NF4).")
+    base_model = load_base_model_for_pipeline(
         args.model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=args.attn_implementation,
+        dtype="auto",
         device_map=device_map,
-        trust_remote_code=True,
+        attn_implementation=args.attn_implementation,
+        use_bnb_quant=args.use_bnb_quant,
     )
 
     draft_token_ids: Optional[List[int]] = None
@@ -832,6 +852,7 @@ def main() -> None:
         draft_token_ids=draft_token_ids,
         aggr_feature_bound=aggr_feature_bound,
         trained_with_use_deepest=args.trained_with_use_deepest,
+        spec_intermediate_size_fallback=args.spec_intermediate_size_fallback,
     )
     init_speculation_lm_head_from_base(pipeline_model)
 

@@ -86,8 +86,14 @@ Reports wall-clock prefill/decode timings, acceptance rate, equivalent accept le
 - **Cycle sync**: end-of-cycle synchronization is a single `wait_all()` on outstanding P2P ops (no per-cycle `dist.barrier`), keeping NCCL recv streams concurrent with verify work.
 - **Timing**: `--profile_timing` in `example_mp_pipeline_generate.py` (on by default) and `eval_mp_pipeline_dataset.py` (off by default) reports per-phase decode breakdown (`recv_snap_sec`, `recv_verify_sec`, `verify_kernel_sec`, `hs_path_sec`, etc.).
 
+## Non-uniform stage partitioning (v12, exploratory)
+
+Uniform SPD needs `num_stages + 1` ranks (PDM on its own rank), so `n=4` / `n=8` often spill past a single 4- or 8-GPU node.
+**v12** checkpoints support uneven `stage_layers` in config: co-locate the PDM with a shallower first stage so the world size stays at 4 or 8, and overlap drafting with the remaining layers on other ranks after a shared first-stage barrier (`L_1` target layers).
+This path is exploratory (preliminary theoretical numbers only; distributed wall-clock still incomplete). Load a v12 checkpoint the same way as above; the loader reads `config['version'] == 12` and `stage_layers` automatically.
+
 ## Notes
 
 - All ranks must `barrier` after model load before decoding; otherwise P2P can hang.
 - `--profile_timing` enables detailed per-stage timing in `example_mp_pipeline_generate.py` (on by default) and optional breakdown in eval.
-- Checkpoints with uneven `stage_layers` in config are supported when `config['version'] == 12`; v11 checkpoints use uniform stage splits.
+- v11 checkpoints use uniform stage splits; v12 supports uneven `stage_layers` as above.

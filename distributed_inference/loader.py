@@ -10,7 +10,7 @@ from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, PreTrainedModel
+from transformers import PreTrainedModel
 from transformers.cache_utils import DynamicCache
 
 from .cache import StageCacheView, make_stage_sharded_caches
@@ -22,10 +22,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from modeling_qwen3_pipeline_v11 import (  # noqa: E402
-    Qwen3PipelineModelV11,
+from pipeline_model import (  # noqa: E402
+    Qwen3SpeculativePipelineModel as Qwen3PipelineModelV11,
     _decoder_relevant_config,
+    _get_text_decoder_backbone,
     _linear_and_hybrid_attention_layer_indices_for_cache,
+    load_base_model_for_pipeline,
     num_hidden_layers_from_hf_config,
     resolve_stage_layer_ranges,
     stage_layers_from_spec_cfg,
@@ -129,6 +131,8 @@ def v11_init_from_spec_cfg(spec_cfg: dict[str, Any]) -> dict[str, Any]:
     }
     if "trained_with_use_deepest" in spec_cfg:
         kw["trained_with_use_deepest"] = bool(spec_cfg["trained_with_use_deepest"])
+    if "spec_intermediate_size_fallback" in spec_cfg:
+        kw["spec_intermediate_size_fallback"] = int(spec_cfg["spec_intermediate_size_fallback"])
     stage_layers = stage_layers_from_spec_cfg(spec_cfg)
     if stage_layers is not None:
         kw["stage_layers"] = stage_layers
@@ -208,11 +212,10 @@ def load_prefill_rank0_bundle(
 ) -> PrefillRank0Bundle:
     spec_cfg = load_spec_checkpoint_config(spec_ckpt_path)
     init_kw = v11_init_from_spec_cfg(spec_cfg)
-    base = AutoModelForCausalLM.from_pretrained(
+    base = load_base_model_for_pipeline(
         base_model_path,
         dtype=dtype,
         device_map={"": device},
-        trust_remote_code=True,
         attn_implementation=attn_implementation,
     )
     base.to(dtype=dtype)
@@ -285,15 +288,15 @@ def load_stage_rank_bundle(
     if rank < 1:
         raise ValueError(f"load_stage_rank_bundle expects rank>=1, got {rank}")
 
-    base = AutoModelForCausalLM.from_pretrained(
+    base = load_base_model_for_pipeline(
         base_model_path,
         dtype=dtype,
         device_map="cpu",
-        trust_remote_code=True,
         attn_implementation=attn_implementation,
     )
     base.to(dtype=dtype)
     base.eval()
+    backbone = _get_text_decoder_backbone(base)
     n_layers = num_hidden_layers_from_hf_config(base.config)
     stage_layers = stage_layers_from_spec_cfg(spec_cfg)
     stage_layer_ranges = resolve_stage_layer_ranges(
@@ -302,13 +305,13 @@ def load_stage_rank_bundle(
         num_layers=n_layers,
     )
     lo, hi = stage_layer_ranges[stage_idx]
-    local_layers = nn.ModuleList([base.model.layers[i] for i in range(lo, hi)])
+    local_layers = nn.ModuleList([backbone.layers[i] for i in range(lo, hi)])
     cast_module(local_layers, device=device, dtype=dtype)
-    rotary = cast_module(copy.deepcopy(base.model.rotary_emb), device=device, dtype=dtype)
+    rotary = cast_module(copy.deepcopy(backbone.rotary_emb), device=device, dtype=dtype)
 
     embed: nn.Embedding | None = None
     if stage_idx == 0:
-        embed = cast_module(copy.deepcopy(base.model.embed_tokens), device=device, dtype=dtype)
+        embed = cast_module(copy.deepcopy(backbone.embed_tokens), device=device, dtype=dtype)
 
     dec_cfg = _decoder_relevant_config(base.config)
     linear_cache_layer_indices = _linear_and_hybrid_attention_layer_indices_for_cache(dec_cfg)

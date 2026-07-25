@@ -17,9 +17,9 @@ from typing import Any
 import numpy as np
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3ForCausalLM
+from transformers import AutoTokenizer, Qwen3ForCausalLM
 
-from pipeline_model import Qwen3SpeculativePipelineModel
+from pipeline_model import Qwen3SpeculativePipelineModel, load_base_model_for_pipeline
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -172,6 +172,8 @@ def _pipeline_init_kwargs(cfg: dict[str, Any], *, version: int) -> dict[str, Any
         raw_bound = cfg.get("aggr_feature_bound")
         if raw_bound is not None:
             kw["aggr_feature_bound"] = [int(x) for x in raw_bound]
+        if "spec_intermediate_size_fallback" in cfg:
+            kw["spec_intermediate_size_fallback"] = int(cfg["spec_intermediate_size_fallback"])
         from pipeline_model import stage_layers_from_spec_cfg
 
         stage_layers = stage_layers_from_spec_cfg(cfg)
@@ -207,12 +209,7 @@ def build_pipeline_from_spec_ckpt(
         PipelineCls = mod.Qwen3SpeculativePipelineModel
         pipeline = PipelineCls(base_model=base_model, **kwargs)
     else:
-        import sys
-
-        root = Path(__file__).resolve().parent.parent
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from modeling_qwen3_pipeline_v11 import Qwen3PipelineModelV11 as PipelineCls
+        from pipeline_model import Qwen3SpeculativePipelineModel as PipelineCls
 
         pipeline = PipelineCls(base_model=base_model, **kwargs)
     pipeline.load_speculation_head(ckpt_path, map_location=map_location)
@@ -354,11 +351,10 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model = load_base_model_for_pipeline(
         base_model_path,
         dtype=dtype,
-        device_map={"":0},
-        trust_remote_code=True,
+        device_map={"": 0},
     )
 
     _infer_pipeline_kind(spec_cfg)

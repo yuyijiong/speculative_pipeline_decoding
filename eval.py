@@ -182,6 +182,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="When using chat template, pass enable_thinking to tokenizer.apply_chat_template (e.g. Qwen3).",
     )
+    p.add_argument(
+        "--use_bnb_quant",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load the frozen base model in 4-bit via bitsandbytes (NF4) to reduce GPU memory.",
+    )
     return p.parse_args()
 
 
@@ -312,6 +318,7 @@ def _baseline_meta_payload(
     enable_thinking: bool,
     data_dir: Path,
     n_total: int,
+    use_bnb_quant: bool = False,
 ) -> dict[str, Any]:
     return {
         "__baseline_meta__": 1,
@@ -321,6 +328,7 @@ def _baseline_meta_payload(
         "max_new_tokens": int(max_new_tokens),
         "no_chat_template": bool(no_chat_template),
         "enable_thinking": bool(enable_thinking),
+        "use_bnb_quant": bool(use_bnb_quant),
         "data_dir": str(Path(data_dir).resolve()),
         "n_total": int(n_total),
     }
@@ -334,12 +342,15 @@ def _baseline_meta_matches_disk(meta: dict[str, Any], expected: dict[str, Any]) 
         "max_new_tokens",
         "no_chat_template",
         "enable_thinking",
+        "use_bnb_quant",
         "data_dir",
         "n_total",
     )
     for k in keys:
         mv = meta.get(k)
         if k == "enable_thinking" and "enable_thinking" not in meta:
+            mv = False
+        if k == "use_bnb_quant" and "use_bnb_quant" not in meta:
             mv = False
         if mv != expected.get(k):
             return False
@@ -378,22 +389,23 @@ def _validate_baseline_cache_indices(by_index: dict[int, dict[str, Any]], n_tota
             )
 
 
-def _build_baseline_stack(base_model_path: str) -> Tuple[Any, Any, Any]:
+def _build_baseline_stack(base_model_path: str, *, use_bnb_quant: bool = False) -> Tuple[Any, Any, Any]:
     import torch
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer
+    from pipeline_model import load_base_model_for_pipeline
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model = load_base_model_for_pipeline(
         base_model_path,
         dtype=torch.bfloat16,
         device_map={"": 0} if torch.cuda.is_available() else None,
         attn_implementation="flash_attention_2",
-        trust_remote_code=True,
+        use_bnb_quant=use_bnb_quant,
     )
     device = next(base_model.parameters()).device
     return tokenizer, base_model, device
@@ -408,8 +420,11 @@ def _run_baseline_batch_for_cache(
     no_chat_template: bool,
     enable_thinking: bool,
     eval_seed: int,
+    use_bnb_quant: bool = False,
 ) -> list[dict[str, Any]]:
-    tokenizer, base_model, device = _build_baseline_stack(base_model_path)
+    tokenizer, base_model, device = _build_baseline_stack(
+        base_model_path, use_bnb_quant=use_bnb_quant
+    )
     greedy = bool(float(temperature) == 0.0)
     use_chat = not bool(no_chat_template)
     out: list[dict[str, Any]] = []
@@ -468,6 +483,7 @@ def _baseline_gpu_process_entry(
     eval_seed: int,
     out_jsonl_path: str,
     progress_q: Any,
+    use_bnb_quant: bool,
 ) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
     try:
@@ -480,6 +496,7 @@ def _baseline_gpu_process_entry(
             no_chat_template=bool(no_chat_template),
             enable_thinking=bool(enable_thinking),
             eval_seed=int(eval_seed),
+            use_bnb_quant=bool(use_bnb_quant),
         )
         outp = Path(out_jsonl_path)
         outp.parent.mkdir(parents=True, exist_ok=True)
@@ -506,6 +523,7 @@ def _run_baseline_batch_multiprocess(
     eval_seed: int,
     gpus: list[int],
     cache_path: Path,
+    use_bnb_quant: bool = False,
 ) -> list[dict[str, Any]]:
     n_total = len(indexed)
     n_wish = int(min(len(gpus), n_total))
@@ -531,6 +549,7 @@ def _run_baseline_batch_multiprocess(
                 int(eval_seed),
                 str(part_paths[si]),
                 progress_q,
+                bool(use_bnb_quant),
             ),
         )
         p.start()
@@ -589,6 +608,7 @@ def ensure_baseline_cache(
     has_cuda: bool,
 ) -> dict[int, dict[str, Any]]:
     n_total = len(indexed)
+    use_bnb_quant = bool(getattr(args, "use_bnb_quant", False))
     expected_meta = _baseline_meta_payload(
         base_model_path,
         temperature,
@@ -598,6 +618,7 @@ def ensure_baseline_cache(
         enable_thinking=bool(args.enable_thinking),
         data_dir=data_dir,
         n_total=n_total,
+        use_bnb_quant=use_bnb_quant,
     )
     if (
         not force_recompute
@@ -623,6 +644,7 @@ def ensure_baseline_cache(
             eval_seed=int(args.seed),
             gpus=gpus,
             cache_path=cache_path,
+            use_bnb_quant=use_bnb_quant,
         )
     else:
         rows = _run_baseline_batch_for_cache(
@@ -633,6 +655,7 @@ def ensure_baseline_cache(
             no_chat_template=bool(args.no_chat_template),
             enable_thinking=bool(args.enable_thinking),
             eval_seed=int(args.seed),
+            use_bnb_quant=use_bnb_quant,
         )
     _write_baseline_cache_jsonl(cache_path, expected_meta, rows)
     return {int(r["index"]): r for r in rows}
@@ -876,7 +899,8 @@ def _build_inference_stack(args: Any) -> Tuple[Any, Any, Any, int]:
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer
+    from pipeline_model import load_base_model_for_pipeline
     from pipeline_inference import (
         _infer_pipeline_kind,
         _read_spec_config,
@@ -893,12 +917,12 @@ def _build_inference_stack(args: Any) -> Tuple[Any, Any, Any, int]:
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_model = load_base_model_for_pipeline(
         base_model_path,
         dtype=torch.bfloat16,
         device_map={"": 0} if torch.cuda.is_available() else None,
         attn_implementation="flash_attention_2",
-        trust_remote_code=True,
+        use_bnb_quant=bool(getattr(args, "use_bnb_quant", False)),
     )
     _infer_pipeline_kind(spec_cfg)
     map_loc = "cuda"

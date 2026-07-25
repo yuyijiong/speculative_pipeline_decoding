@@ -251,7 +251,7 @@ def _init_rank0_controller(
 ) -> tuple[Rank0Controller, int, int]:
     r0_bundle = load_rank0_decode_bundle(prefill_bundle, device)
     if release_base_layers:
-        prefill_bundle.pipe.base_model.model.layers = torch.nn.ModuleList()
+        prefill_bundle.pipe._decoder_backbone.layers = torch.nn.ModuleList()
         torch.cuda.empty_cache()
 
     trained_deepest = bool(getattr(prefill_bundle.pipe, "trained_with_use_deepest", False))
